@@ -31,9 +31,4 @@ Rendering with the feature off and on inside one Blender session gives
 byte-identical output where it should. Normal, True Normal and Position probes:
 zero differing channels. The scene seen from the light: zero.
 
-## What it can't do yet
-
-- OptiX only — no CPU path, no macOS.
-- One emissive or volume prototype disables nesting for the whole scene.
-- Each group member still costs a full object record — the main memory cost left.
-- Motion blur with groups is untested.
+What's still to do is listed at the bottom of the README.

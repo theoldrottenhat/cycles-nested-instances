@@ -51,3 +51,18 @@ Visual Studio 2022, CUDA 13.3, OptiX 9.1.0.
 
 GPL, like Blender. Patch applies to Blender `v5.2.0` (`fbe6228777e7`).
 See `EXPLAINER-nested-instancing.md`.
+
+## Left to do
+
+- [ ] **CPU path.** The bundled Embree allows one level of instancing, so
+      nesting is OptiX-only. Needs an Embree built for more levels.
+- [ ] **Emissive and volume prototypes.** One of either disables nesting for the
+      whole scene. Lights are indexed per object and sampled in world space, and
+      a group member has neither an object nor a world transform of its own.
+- [ ] **Test on macOS and Linux.** Built and tested on Windows only.
+- [ ] **Bake the features in.** Drop the environment variable and the per-object
+      opt-in once they've earned it, so this is just how Cycles works.
+- [ ] **Move the viewport toggle into geometry nodes.** An `Is Cycles` output
+      alongside `Is Viewport`, or a control on `Is Viewport` itself — closer to
+      how Blender already does this than a per-object visibility flag.
+- [ ] Motion blur with groups is untested.
