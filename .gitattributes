@@ -1,0 +1,4 @@
+# Never touch the patch: git apply fails on CRLF-converted diffs.
+*.patch -text
+# The launcher is a Windows batch file.
+*.cmd text eol=crlf
