@@ -1,0 +1,3428 @@
+diff --git a/intern/cycles/blender/addon/properties.py b/intern/cycles/blender/addon/properties.py
+index e644ccb9248..a3f1ce9e661 100644
+--- a/intern/cycles/blender/addon/properties.py
++++ b/intern/cycles/blender/addon/properties.py
+@@ -1478,6 +1478,31 @@ class CyclesObjectSettings(bpy.types.PropertyGroup):
+         default=False,
+     )
+ 
++    # Proxy to a portable top-level custom property ("cycles_render_instancer").
++    # Storing it there (rather than in this RNA group) means the depsgraph and
++    # Cycles both read it, and a file opened in standard Blender simply carries an
++    # inert custom property -- the toggle has no effect and nothing breaks.
++    def _get_render_instancer(self):
++        return bool(self.id_data.get("cycles_render_instancer", False))
++
++    def _set_render_instancer(self, value):
++        ob = self.id_data
++        if value:
++            ob["cycles_render_instancer"] = True
++        elif "cycles_render_instancer" in ob:
++            del ob["cycles_render_instancer"]
++        ob.update_tag()
++
++    render_instancer: BoolProperty(
++        name="Render Instances Directly",
++        description="Read this object's geometry-nodes instances directly at render time instead of "
++        "expanding them into real duplicates. Hugely speeds up sync and interactive re-sync for very "
++        "high instance counts. Stored as a portable custom property, so files still open in standard "
++        "Blender where it simply has no effect",
++        get=_get_render_instancer,
++        set=_set_render_instancer,
++    )
++
+     @classmethod
+     def register(cls):
+         bpy.types.Object.cycles = PointerProperty(
+diff --git a/intern/cycles/blender/addon/ui.py b/intern/cycles/blender/addon/ui.py
+index 80799e48f79..f26c8e114e6 100644
+--- a/intern/cycles/blender/addon/ui.py
++++ b/intern/cycles/blender/addon/ui.py
+@@ -1472,12 +1472,16 @@ class CYCLES_OBJECT_PT_visibility(CyclesButtonsPanel, Panel):
+         col = layout.column(heading="Show In")
+         col.prop(ob, "hide_viewport", text="Viewports", invert_checkbox=True, toggle=False)
+         col.prop(ob, "hide_render", text="Renders", invert_checkbox=True, toggle=False)
++        col.prop(ob, "hide_rasterizer", text="Solid/EEVEE Viewports", invert_checkbox=True, toggle=False)
+ 
+         if has_geometry_visibility(ob):
+             col = layout.column(heading="Mask")
+             col.prop(ob, "is_shadow_catcher")
+             col.prop(ob, "is_holdout")
+ 
++        layout.separator()
++        layout.prop(ob.cycles, "render_instancer")
++
+ 
+ class CYCLES_OBJECT_PT_visibility_ray_visibility(CyclesButtonsPanel, Panel):
+     bl_label = "Ray Visibility"
+diff --git a/intern/cycles/blender/object.cpp b/intern/cycles/blender/object.cpp
+index 319aa849515..96f16a2f66e 100644
+--- a/intern/cycles/blender/object.cpp
++++ b/intern/cycles/blender/object.cpp
+@@ -21,8 +21,14 @@
+ #include "util/hash.h"
+ #include "util/log.h"
+ #include "util/task.h"
++#include "util/time.h"
+ 
++#include "BKE_attribute.hh"
++#include "BKE_collection.hh"
+ #include "BKE_duplilist.hh"
++#include "BKE_geometry_set.hh"
++#include "BKE_idprop.hh"
++#include "BKE_instances.hh"
+ #include "BKE_layer.hh"
+ #include "BKE_material.hh"
+ #include "BKE_object.hh"
+@@ -458,6 +464,764 @@ bool BlenderSync::sync_object_attributes(blender::Object &b_ob,
+   return changed;
+ }
+ 
++/* Render Instances
++ *
++ * For a point cloud tagged with the "cycles_render_instancer" custom property,
++ * read its evaluated points directly and create one Cycles object per point,
++ * all sharing a single prototype geometry. This bypasses object_duplilist(),
++ * which the depsgraph iterator otherwise re-runs in full on every sync.
++ *
++ * M0: position and uniform scale only. No orient, collections, materials or
++ * motion blur yet. */
++
++bool BlenderSync::object_is_render_instancer(blender::Object &b_ob)
++{
++  if (b_ob.id.properties == nullptr) {
++    return false;
++  }
++  const blender::IDProperty *prop = blender::IDP_GetPropertyFromGroup(
++      b_ob.id.properties, "cycles_render_instancer");
++  if (prop == nullptr) {
++    return false;
++  }
++  /* Python bools arrive as IDP_BOOLEAN, but older files may carry IDP_INT.
++   * Both store the value in data.val (see IDP_bool_get / IDP_int_get). */
++  if (prop->type != blender::IDP_BOOLEAN && prop->type != blender::IDP_INT) {
++    return false;
++  }
++  if (prop->data.val == 0) {
++    return false;
++  }
++  /* Only meaningful when geometry nodes actually produced unrealized
++   * instances for us to read. */
++  const blender::bke::GeometrySet *b_geometry_set = b_ob.runtime->geometry_set_eval;
++  return b_geometry_set != nullptr && b_geometry_set->has_instances();
++}
++
++/* Flatten one instance reference into the geometry it actually draws, with
++ * each piece's transform relative to the instance. Mirrors what
++ * object_duplilist() would have produced:
++ *   - Object      -> the object's own geometry
++ *   - GeometrySet -> its mesh, and/or nested instances (recursed)
++ *   - Collection  -> every visible member, offset by instance_offset
++ *                    (see make_duplis_collection in object_dupli.cc)
++ */
++void BlenderSync::render_instances_collect_prototypes(
++    const blender::bke::InstanceReference &b_reference,
++    const Transform &local,
++    blender::Object &b_instancer,
++    vector<RenderInstanceProto> &r_protos,
++    const int depth)
++{
++  /* Same recursion bound Blender uses for duplis. */
++  /* Match Blender's dupli recursion limit exactly. object_dupli.cc stops when
++   * level == MAX_DUPLI_RECUR - 1 (== 7); our depth counter is offset one level
++   * deeper than its `level`, so truncating at 7 aligns the two. */
++  if (depth >= 7) {
++    LOG_INFO << "render-instances: recursion limit reached, nested instances truncated";
++    return;
++  }
++
++  switch (b_reference.type()) {
++    case blender::bke::InstanceReference::Type::Object: {
++      blender::Object *b_proto = &b_reference.object();
++      const bool adaptive = object_subdivision_type(*b_proto, preview, use_adaptive_subdivision) !=
++                            Mesh::SUBDIVISION_NONE;
++      BObjectInfo b_proto_info{b_proto, b_proto, object_get_data(*b_proto, adaptive), adaptive};
++
++      /* Realized geometry, if the object has any. An object can be a pure
++       * instancer with no mesh of its own, so this must not return early -- the
++       * instances below are the whole point of such an object. */
++      if (object_is_geometry(b_proto_info)) {
++        Geometry *geometry = sync_geometry(b_proto_info, false, false, nullptr);
++        if (geometry) {
++          r_protos.push_back({geometry,
++                              local,
++                              object_ray_visibility(*b_proto),
++                              (b_proto->visibility_flag & blender::OB_SHADOW_CATCHER) != 0});
++        }
++      }
++
++      /* The instanced object may itself be an instancer: a tree whose leaves are
++       * scattered by geometry nodes. Only its realized geometry was synced
++       * above, so without this the tree arrives as a bare trunk, or as nothing
++       * at all when it has no mesh of its own. */
++      const blender::bke::GeometrySet *b_proto_set = b_proto->runtime ?
++                                                         b_proto->runtime->geometry_set_eval :
++                                                         nullptr;
++      const blender::bke::Instances *b_proto_instances = (b_proto_set != nullptr) ?
++                                                             b_proto_set->get_instances() :
++                                                             nullptr;
++      if (b_proto_instances != nullptr) {
++        const blender::Span<blender::float4x4> b_proto_tfms = b_proto_instances->transforms();
++        const blender::Span<int> b_proto_handles = b_proto_instances->reference_handles();
++        const blender::Span<blender::bke::InstanceReference> b_proto_refs =
++            b_proto_instances->references();
++        for (const int i : blender::IndexRange(b_proto_tfms.size())) {
++          render_instances_collect_prototypes(b_proto_refs[b_proto_handles[i]],
++                                              local * get_transform(b_proto_tfms[i]),
++                                              b_instancer,
++                                              r_protos,
++                                              depth + 1);
++        }
++      }
++      return;
++    }
++
++    case blender::bke::InstanceReference::Type::GeometrySet: {
++      const blender::bke::GeometrySet &b_set = b_reference.geometry_set();
++
++      const blender::Mesh *b_mesh = b_set.get_mesh();
++      if (b_mesh != nullptr) {
++        blender::ID *b_mesh_id = const_cast<blender::ID *>(&b_mesh->id);
++        BObjectInfo b_proto_info{&b_instancer, &b_instancer, b_mesh_id, false};
++        Geometry *geometry = sync_geometry(b_proto_info, false, false, nullptr);
++        if (geometry) {
++          /* sync_geometry resolves materials from the *object's* slots
++           * (find_used_shaders, geometry.cpp:112). The instancer has none, so
++           * anonymous geometry would silently render with the default shader.
++           * Its materials live on the mesh itself, so resolve them from there.
++           * Slot order matches, so the per-face shader indices stay valid. */
++          array<Node *> mesh_shaders;
++          blender::Material *material_override = view_layer.material_override;
++          for (int m = 0; m < b_mesh->totcol; m++) {
++            if (material_override) {
++              find_shader(&material_override->id, mesh_shaders, scene->default_surface);
++            }
++            else {
++              find_shader(reinterpret_cast<blender::ID *>(b_mesh->mat[m]),
++                          mesh_shaders,
++                          scene->default_surface);
++            }
++          }
++          if (!mesh_shaders.empty()) {
++            geometry->set_used_shaders(mesh_shaders);
++          }
++
++          /* Anonymous geometry owns no object, so it carries no flags of its
++           * own; everything comes from the instancer. */
++          r_protos.push_back({geometry, local, PathRayVisibility(PATH_RAY_VISIBILITY_ALL), false});
++        }
++      }
++
++      /* Nested instances, e.g. Object Info with "As Instance" feeding
++       * Instance on Points. */
++      const blender::bke::Instances *b_nested = b_set.get_instances();
++      if (b_nested != nullptr) {
++        const blender::Span<blender::float4x4> b_nested_tfms = b_nested->transforms();
++        const blender::Span<int> b_nested_handles = b_nested->reference_handles();
++        const blender::Span<blender::bke::InstanceReference> b_nested_refs =
++            b_nested->references();
++        for (const int i : blender::IndexRange(b_nested_tfms.size())) {
++          render_instances_collect_prototypes(b_nested_refs[b_nested_handles[i]],
++                                              local * get_transform(b_nested_tfms[i]),
++                                              b_instancer,
++                                              r_protos,
++                                              depth + 1);
++        }
++      }
++      return;
++    }
++
++    case blender::bke::InstanceReference::Type::Collection: {
++      blender::Collection &b_collection = b_reference.collection();
++
++      /* The collection offset applies before member transforms. */
++      const Transform collection_local =
++          local * transform_translate(-make_float3(b_collection.instance_offset[0],
++                                                   b_collection.instance_offset[1],
++                                                   b_collection.instance_offset[2]));
++
++      const int base_flag = preview ? blender::BASE_ENABLED_VIEWPORT : blender::BASE_ENABLED_RENDER;
++      const int hide_flag = preview ? blender::OB_HIDE_VIEWPORT : blender::OB_HIDE_RENDER;
++
++      /* Cache list is already flattened over nested collections. */
++      for (blender::Base *b_base = static_cast<blender::Base *>(
++               blender::BKE_collection_object_cache_get(&b_collection).first);
++           b_base;
++           b_base = b_base->next)
++      {
++        blender::Object *b_member = b_base->object;
++        if (b_member == nullptr || b_member == &b_instancer) {
++          continue;
++        }
++        if ((b_base->flag & base_flag) == 0 || (b_member->visibility_flag & hide_flag) != 0) {
++          continue;
++        }
++        const bool adaptive = object_subdivision_type(
++                                  *b_member, preview, use_adaptive_subdivision) !=
++                              Mesh::SUBDIVISION_NONE;
++        BObjectInfo b_member_info{
++            b_member, b_member, object_get_data(*b_member, adaptive), adaptive};
++        if (!object_is_geometry(b_member_info)) {
++          continue;
++        }
++        Geometry *geometry = sync_geometry(b_member_info, false, false, nullptr);
++        if (geometry) {
++          r_protos.push_back({geometry,
++                              collection_local * get_transform(b_member->object_to_world()),
++                              object_ray_visibility(*b_member),
++                              (b_member->visibility_flag & blender::OB_SHADOW_CATCHER) != 0});
++        }
++
++        /* A member may itself be an instancer, e.g. a collection holding a
++         * trunk mesh plus an object whose geometry nodes scatter leaves. Only
++         * its realized geometry was synced above; without this its instances
++         * are silently dropped. The GeometrySet case below already recurses --
++         * this is the same handling for collection members. */
++        const blender::bke::GeometrySet *b_member_set = b_member->runtime ?
++                                                            b_member->runtime->geometry_set_eval :
++                                                            nullptr;
++        const blender::bke::Instances *b_member_instances = (b_member_set != nullptr) ?
++                                                                b_member_set->get_instances() :
++                                                                nullptr;
++        if (b_member_instances != nullptr) {
++          const Transform member_local = collection_local *
++                                         get_transform(b_member->object_to_world());
++          const blender::Span<blender::float4x4> b_member_tfms = b_member_instances->transforms();
++          const blender::Span<int> b_member_handles = b_member_instances->reference_handles();
++          const blender::Span<blender::bke::InstanceReference> b_member_refs =
++              b_member_instances->references();
++          for (const int i : blender::IndexRange(b_member_tfms.size())) {
++            render_instances_collect_prototypes(b_member_refs[b_member_handles[i]],
++                                                member_local * get_transform(b_member_tfms[i]),
++                                                b_instancer,
++                                                r_protos,
++                                                depth + 1);
++          }
++        }
++      }
++      return;
++    }
++
++    case blender::bke::InstanceReference::Type::None:
++    default:
++      return;
++  }
++}
++
++/* Whether a shader might emit light.
++ *
++ * Deliberately conservative: a false positive costs an instancer the group path
++ * and falls back to flat objects, which is merely slower. A false negative puts
++ * emissive geometry inside a group, which faults on the device.
++ *
++ * Shader::emission_sampling cannot be used here. It is derived during shader
++ * compilation, long after sync, so at this point it always reads as NONE --
++ * which is why an earlier version of this check silently never fired.
++ * ShaderNode::has_surface_emission() is Cycles' own test and is valid as soon
++ * as the graph exists. */
++static bool shader_graph_may_emit(const Shader *shader)
++{
++  const ShaderGraph *graph = shader->graph.get();
++  if (graph == nullptr) {
++    return false;
++  }
++  for (const ShaderNode *node : graph->nodes) {
++    if (const_cast<ShaderNode *>(node)->has_surface_emission()) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void BlenderSync::render_instances_pre_sync()
++{
++  for (auto &entry : render_instance_sets) {
++    entry.second.used = false;
++  }
++
++  /* Groups are rebuilt from scratch each sync, so clear before any instancer
++   * appends to them.
++   *
++   * Note that an instancer taking the unchanged-instancer fast path in
++   * sync_render_instances() appends nothing, so its group is absent for that
++   * sync. Harmless while groups are expanded immediately and read by nobody,
++   * but a later phase that consumes them on the device must either rebuild
++   * them unconditionally or keep them across syncs. */
++  scene->object_groups.clear();
++  scene->object_group_instances.clear();
++  render_instances_groups_unsafe = false;
++}
++
++void BlenderSync::render_instances_post_sync()
++{
++  /* These objects are deliberately not in object_map, so id_map's sweep never
++   * sees them. Free the sets whose instancer is gone or no longer tagged. */
++  set<Object *> to_delete;
++  for (auto it = render_instance_sets.begin(); it != render_instance_sets.end();) {
++    if (it->second.used) {
++      ++it;
++      continue;
++    }
++    for (Object *object : it->second.objects) {
++      to_delete.insert(object);
++    }
++    for (Object *prototype : it->second.prototypes) {
++      to_delete.insert(prototype);
++    }
++    it = render_instance_sets.erase(it);
++  }
++  if (!to_delete.empty()) {
++    scene->delete_nodes(to_delete);
++  }
++
++  /* Groups are all-or-nothing for a scene: if any instancer had to fall back,
++   * every instancer expanded into flat objects, so any groups built before that
++   * point must not reach the device. */
++  if (render_instances_groups_unsafe) {
++    scene->object_groups.clear();
++    scene->object_group_instances.clear();
++  }
++
++  render_instances_recalc.clear();
++}
++
++void BlenderSync::sync_render_instances(blender::Depsgraph &b_depsgraph,
++                                        blender::ViewLayer &b_view_layer,
++                                        blender::Object &b_ob,
++                                        const float motion_time)
++{
++  (void)b_depsgraph;
++
++  /* Read the instances geometry nodes already built, in their unrealized form.
++   * This is the same data object_duplilist() would expand into a DupliObject
++   * list; we consume it directly and skip that expansion. */
++  const blender::bke::GeometrySet *b_geometry_set = b_ob.runtime->geometry_set_eval;
++  if (b_geometry_set == nullptr) {
++    return;
++  }
++  const blender::bke::Instances *b_instances = b_geometry_set->get_instances();
++  if (b_instances == nullptr) {
++    return;
++  }
++
++  const blender::Span<blender::float4x4> b_transforms = b_instances->transforms();
++  const blender::Span<int> b_handles = b_instances->reference_handles();
++  const blender::Span<blender::bke::InstanceReference> b_references = b_instances->references();
++  const int num_instances = b_transforms.size();
++  if (num_instances == 0) {
++    return;
++  }
++
++  /* Flatten each distinct reference once into the geometry it draws. A
++   * reference may expand to several pieces (collection members, nested
++   * instances), so instances index into a per-handle list. */
++  const int num_references = b_references.size();
++  vector<vector<RenderInstanceProto>> protos_by_handle(num_references);
++  int num_empty_refs = 0;
++
++  for (int h = 0; h < num_references; h++) {
++    render_instances_collect_prototypes(
++        b_references[h], transform_identity(), b_ob, protos_by_handle[h], 0);
++    if (protos_by_handle[h].empty()) {
++      num_empty_refs++;
++    }
++  }
++
++  /* Total objects needed: one per (instance, prototype piece). */
++  size_t num_objects_needed = 0;
++  for (int i = 0; i < num_instances; i++) {
++    num_objects_needed += protos_by_handle[b_handles[i]].size();
++  }
++
++  /* Total prototypes needed: one per piece, shared by every instance that draws
++   * it. Counted here so the tail can be trimmed alongside the objects below. */
++  size_t num_prototypes_needed = 0;
++  for (int h = 0; h < num_references; h++) {
++    num_prototypes_needed += protos_by_handle[h].size();
++  }
++
++  if (num_objects_needed == 0) {
++    LOG_INFO << "render-instances: no drawable geometry from " << num_references
++             << " references, nothing synced";
++    return;
++  }
++
++  /* Instancer-source Attribute nodes. Blender resolves these via
++   * BKE_object_dupli_find_rgba_attribute -> find_geonode_attribute_rgba
++   * (object_dupli.cc:1942), which reads the named attribute off the instances
++   * component at the instance index. We have that component directly, so read
++   * it the same way instead of needing a DupliObject.
++   *
++   * Only gathered when a shader actually asks for one, so scenes that do not
++   * use instancer attributes pay nothing. */
++  struct InstancerAttribute {
++    ustring name;
++    blender::VArray<blender::ColorGeometry4f> data;
++  };
++  vector<InstancerAttribute> instancer_attributes;
++  {
++    set<ustring> seen;
++    const blender::bke::AttributeAccessor b_inst_attributes = b_instances->attributes();
++    for (const vector<RenderInstanceProto> &protos : protos_by_handle) {
++      for (const RenderInstanceProto &proto : protos) {
++        if (proto.geometry == nullptr) {
++          continue;
++        }
++        AttributeRequestSet requests = proto.geometry->needed_attributes();
++        for (const AttributeRequest &req : requests.requests) {
++          const ustring name = req.name;
++          if (seen.find(name) != seen.end()) {
++            continue;
++          }
++          std::string real_name;
++          if (blender_attribute_name_split_type(name, &real_name) !=
++              blender::SHD_ATTRIBUTE_INSTANCER)
++          {
++            continue;
++          }
++          seen.insert(name);
++          blender::VArray<blender::ColorGeometry4f> data =
++              *b_inst_attributes.lookup<blender::ColorGeometry4f>(real_name,
++                                                                  blender::bke::AttrDomain::Instance);
++          if (data) {
++            instancer_attributes.push_back({name, std::move(data)});
++          }
++        }
++      }
++    }
++  }
++  if (!instancer_attributes.empty()) {
++    LOG_INFO << "render-instances: " << instancer_attributes.size()
++             << " instancer attribute(s) requested by shaders";
++  }
++
++  /* Instance transforms are relative to the instancer. */
++  const Transform instancer_tfm = get_transform(b_ob.object_to_world());
++
++  /* Per-instance flags, mirroring what sync_object() derives for a dupli.
++   * The instancer plays the role of the dupli parent. */
++  const blender::Base *base = BKE_view_layer_base_find(&b_view_layer, &b_ob);
++  const bool use_holdout = (base && (base->flag & blender::BASE_HOLDOUT) != 0) ||
++                           ((b_ob.visibility_flag & blender::OB_HOLDOUT) != 0);
++  const bool instancer_shadow_catcher = (b_ob.visibility_flag & blender::OB_SHADOW_CATCHER) != 0;
++  const PathRayVisibility instancer_visibility = object_ray_visibility(b_ob);
++  const bool use_indirect_only = !use_holdout && base &&
++                                 ((base->flag & blender::BASE_INDIRECT_ONLY) != 0);
++
++  blender::PointerRNA b_ob_rna_ptr = RNA_id_pointer_create(&b_ob.id);
++  blender::PointerRNA cobject = RNA_pointer_get(&b_ob_rna_ptr, "cycles");
++  const float ao_distance = get_float(cobject, "ao_distance");
++  const bool is_caustics_caster = get_boolean(cobject, "is_caustics_caster");
++  const bool is_caustics_receiver = get_boolean(cobject, "is_caustics_receiver");
++  const float shadow_terminator_shading_offset = b_ob.shadow_terminator_shading_offset;
++  const float shadow_terminator_geometry_offset = b_ob.shadow_terminator_geometry_offset;
++
++  /* Flat per-instancer storage, indexed by instance index. Objects persist
++   * across syncs here instead of in object_map, so steady-state re-sync is an
++   * array index rather than an ordered-map lookup. */
++  RenderInstanceSet &instance_set = render_instance_sets[&b_ob];
++  instance_set.used = true;
++
++  /* Motion pass: sync_objects() is re-run once per motion step. Rebuilding
++   * here would overwrite the center-time transforms with this step's, leaving
++   * the instances at the wrong place and recording no motion at all. Instead
++   * write this step into the existing objects' motion arrays. */
++  if (motion_time != 0.0f) {
++    const map<void *, RenderInstanceSet>::iterator it = render_instance_sets.find(&b_ob);
++    if (it == render_instance_sets.end() || it->second.objects.size() != num_objects_needed) {
++      return;
++    }
++    size_t motion_slot = 0;
++    for (int i = 0; i < num_instances; i++) {
++      const Transform instance_tfm = instancer_tfm * get_transform(b_transforms[i]);
++      for (const RenderInstanceProto &proto : protos_by_handle[b_handles[i]]) {
++        Object *object = it->second.objects[motion_slot++];
++        if (object->use_motion()) {
++          const int time_index = object->motion_step(motion_time);
++          if (time_index >= 0) {
++            object->set_motion_tfm(instance_tfm * proto.local, time_index);
++          }
++        }
++      }
++    }
++    return;
++  }
++
++  /* If the depsgraph did not touch this instancer, its instances are already
++   * correct from the previous sync and the whole per-instance loop can be
++   * skipped -- this is what stops editing one instancer from stalling every
++   * other one. Marking the set used above keeps the objects alive, and the
++   * prototypes were re-synced above so geometry_map will not free them.
++   *
++   * Only safe when the object count is unchanged; otherwise fall through and
++   * rebuild. */
++  /* Read fresh rather than cached in a static: a static is read once per
++   * process, which forces a full Blender restart to flip the feature and
++   * makes an interactive A/B impossible. This runs once per sync. */
++  const bool groups_requested = (getenv("CYCLES_NESTED_SHARED") != nullptr);
++
++  /* Emissive and volume geometry cannot live in a group yet.
++   *
++   * The light system indexes emitters per object and samples them in world
++   * space, and a group member has neither an object of its own nor a world
++   * transform -- the transform only exists once composed with a placement.
++   * Rendering an emissive member currently faults on the device rather than
++   * merely looking wrong, so such an instancer falls back to expanding into
++   * flat objects: slower and heavier, but correct.
++   *
++   * Volumes are excluded for the same reason: volume stack entries and the
++   * camera-inside-volume test both key off world-space object bounds. */
++  bool groups_enabled = groups_requested && !render_instances_groups_unsafe;
++  if (groups_enabled) {
++    for (int h = 0; h < num_references && groups_enabled; h++) {
++      for (const RenderInstanceProto &proto : protos_by_handle[h]) {
++        const Geometry *geom = proto.geometry;
++        if (geom == nullptr) {
++          continue;
++        }
++        if (geom->has_volume) {
++          groups_enabled = false;
++          render_instances_groups_unsafe = true;
++          LOG_INFO << "render-instances: volume in prototype, falling back to flat objects";
++          break;
++        }
++        for (Node *node : geom->get_used_shaders()) {
++          const Shader *shader = static_cast<const Shader *>(node);
++          /* Shader::emission_sampling is not usable here: it is derived during
++           * shader compilation, which happens well after sync, so at this point
++           * it always reads as NONE. Inspect the graph instead, which is built
++           * by the time objects are synced. */
++          if (shader_graph_may_emit(shader)) {
++            groups_enabled = false;
++            render_instances_groups_unsafe = true;
++            LOG_INFO << "render-instances: emissive prototype, falling back to flat objects";
++            break;
++          }
++        }
++      }
++    }
++  }
++
++  /* With groups the device consumes them directly, and they are cleared at the
++   * start of every sync, so this instancer must rebuild them even when nothing
++   * about it changed. Skipping would leave its group absent for that sync. */
++  if (!groups_enabled && !render_instances_recalc.contains(&b_ob) &&
++      instance_set.objects.size() == num_objects_needed && num_objects_needed > 0 &&
++      instance_set.prototypes.size() == num_prototypes_needed)
++  {
++    LOG_INFO << "render-instances: " << num_instances << " instances unchanged, loop skipped";
++    return;
++  }
++
++  /* Object count shrank: free the tail. */
++  if (instance_set.objects.size() > num_objects_needed) {
++    set<Object *> to_delete;
++    for (size_t i = num_objects_needed; i < instance_set.objects.size(); i++) {
++      to_delete.insert(instance_set.objects[i]);
++    }
++    scene->delete_nodes(to_delete);
++    instance_set.objects.resize(num_objects_needed);
++  }
++
++  /* Prototype count shrank: free the tail, for the same reason.
++   *
++   * Prototypes are grown on demand and reused by index below, so without this a
++   * shrinking member count -- removing an object from an instanced collection,
++   * or regrowing a tree with fewer twigs -- leaves the prototypes past the new
++   * end alive in scene->objects. Nothing marks their geometry used this sync,
++   * so geometry_map.post_sync() frees it and the next device_update_transforms
++   * reads a destroyed Geometry through them. */
++  if (instance_set.prototypes.size() > num_prototypes_needed) {
++    set<Object *> to_delete;
++    for (size_t i = num_prototypes_needed; i < instance_set.prototypes.size(); i++) {
++      to_delete.insert(instance_set.prototypes[i]);
++    }
++    scene->delete_nodes(to_delete);
++    instance_set.prototypes.resize(num_prototypes_needed);
++  }
++
++  const double t_start = time_dt();
++  double t_map = 0.0;
++  size_t slot = 0;
++
++  /* Promote the prototype table and the instance list to Scene state.
++   *
++   * protos_by_handle is already deduplicated per reference, so it is a
++   * prototype table in all but name; this just gives it a home the BVH builder
++   * can reach. The expansion below then turns groups back into flat Objects,
++   * producing exactly the same objects in exactly the same order, so nothing
++   * downstream can tell the difference yet.
++   *
++   * Member transforms stay group-local. The world transform only comes into
++   * existence during expansion, which is what a later phase stops doing. */
++  const int group_base = int(scene->object_groups.size());
++  size_t proto_slot = 0;
++  vector<int> group_of_handle(num_references, -1);
++  for (int h = 0; h < num_references; h++) {
++    if (protos_by_handle[h].empty()) {
++      continue;
++    }
++    group_of_handle[h] = int(scene->object_groups.size());
++    scene->object_groups.push_back(ObjectGroup());
++    ObjectGroup &group = scene->object_groups.back();
++    group.members.reserve(protos_by_handle[h].size());
++    for (const RenderInstanceProto &proto : protos_by_handle[h]) {
++      ObjectGroupMember member;
++      member.geometry = proto.geometry;
++      member.local = proto.local;
++      /* Combined here rather than left to the two acceleration-structure levels.
++       * OptiX tests each level's visibility mask INDEPENDENTLY, so a ray is
++       * culled only if it fails at some level - whereas the flat path culls on
++       * the intersection of the two masks. Those differ as soon as a ray
++       * carries more than one visibility bit, and the nested form is the more
++       * permissive one, leaving geometry visible that should be hidden.
++       *
++       * A group belongs to a single instancer, so folding the instancer's
++       * visibility in here is exact. */
++      member.visibility = proto.visibility & instancer_visibility;
++      if (use_indirect_only) {
++        member.visibility &= ~PATH_RAY_VISIBILITY_CAMERA;
++      }
++      member.is_shadow_catcher = proto.is_shadow_catcher;
++
++      /* One prototype Object per member, holding the geometry, shader and
++       * attribute data the kernel needs for a hit inside this group. Reused by
++       * index across syncs so steady-state re-sync does not churn them.
++       *
++       * There are M of these, against the N * M objects the expansion below
++       * still produces. Its transform is left identity: a member's world
++       * transform is composed from a placement transform and member.local, and
++       * storing it here would be storing the thing this avoids. */
++      if (proto_slot >= instance_set.prototypes.size()) {
++        instance_set.prototypes.push_back(scene->create_node<Object>());
++      }
++      Object *prototype = instance_set.prototypes[proto_slot++];
++      prototype->is_group_prototype = true;
++      prototype->set_geometry(proto.geometry);
++      /* Everything the flat path sets on an expanded object has to be set here
++       * too. A prototype IS the object record the kernel reads for a member, so
++       * anything left at its default diverges from the flat path -- and the
++       * shadow-affecting ones (visibility, holdout, shadow catcher, terminator
++       * offsets) diverge in ways that only show up in lighting, not geometry. */
++      prototype->set_use_holdout(use_holdout);
++      prototype->set_ao_distance(ao_distance);
++      prototype->set_is_caustics_caster(is_caustics_caster);
++      prototype->set_is_caustics_receiver(is_caustics_receiver);
++      prototype->set_shadow_terminator_shading_offset(shadow_terminator_shading_offset);
++      prototype->set_shadow_terminator_geometry_offset(shadow_terminator_geometry_offset);
++      /* The member's group-local transform lives here. A prototype is 1:1 with
++       * a member and is never traced directly, so its transform is free to
++       * carry this - which lets the kernel compose a world transform from just
++       * the prototype and the placement, with no third index. */
++      prototype->set_tfm(proto.local);
++      prototype->set_visibility(member.visibility);
++      prototype->set_is_shadow_catcher(proto.is_shadow_catcher || instancer_shadow_catcher);
++      prototype->tag_update(scene);
++      member.prototype = prototype;
++
++      group.members.push_back(member);
++    }
++  }
++  (void)group_base;
++  /* The build above must have filled exactly the prototypes trimmed to. */
++  assert(proto_slot == num_prototypes_needed);
++
++  const int instance_base = int(scene->object_group_instances.size());
++  scene->object_group_instances.reserve(scene->object_group_instances.size() + num_instances);
++  for (int i = 0; i < num_instances; i++) {
++    ObjectGroupInstance instance;
++    instance.group = group_of_handle[b_handles[i]];
++    instance.tfm = instancer_tfm * get_transform(b_transforms[i]);
++    instance.visibility = instancer_visibility;
++    /* Matches the flat path below. The second term is a placeholder for the
++     * member index, which is what makes per-member variation possible without
++     * storing a value per visible instance. */
++    instance.random_id = hash_uint2(i, 0);
++    instance.use_holdout = use_holdout;
++    instance.is_shadow_catcher = instancer_shadow_catcher;
++    scene->object_group_instances.push_back(instance);
++  }
++
++  /* Expand groups into flat Objects.
++   *
++   * This is the N * M cost: one Object per placement per member. With groups
++   * the renderer traces the group's own structure and resolves prototypes and
++   * placements directly, so the expansion is skipped and the scene holds M
++   * prototypes plus N placements instead. */
++  if (groups_enabled) {
++    if (!instance_set.objects.empty()) {
++      set<Object *> to_delete;
++      for (Object *object : instance_set.objects) {
++        to_delete.insert(object);
++      }
++      scene->delete_nodes(to_delete);
++      instance_set.objects.clear();
++    }
++    LOG_INFO << "render-instances: " << num_instances << " placements over "
++             << scene->object_groups.size() << " group(s), expansion skipped";
++    return;
++  }
++
++  for (int i = 0; i < num_instances; i++) {
++    const ObjectGroupInstance &instance = scene->object_group_instances[instance_base + i];
++    if (instance.group < 0) {
++      continue;
++    }
++    const ObjectGroup &group = scene->object_groups[instance.group];
++    const Transform instance_tfm = instance.tfm;
++
++    for (const ObjectGroupMember &proto : group.members) {
++      const double t0 = time_dt();
++      if (slot >= instance_set.objects.size()) {
++        instance_set.objects.push_back(scene->create_node<Object>());
++      }
++      Object *object = instance_set.objects[slot];
++      t_map += time_dt() - t0;
++
++      object->is_group_expanded = true;
++      object->set_geometry(proto.geometry);
++      object->set_tfm(instance_tfm * proto.local);
++
++      /* Visibility is the intersection of prototype and instancer, exactly as
++       * sync_object() ANDs a dupli with its parent. */
++      PathRayVisibility visibility = proto.visibility & instancer_visibility;
++      if (use_indirect_only) {
++        visibility &= ~PATH_RAY_VISIBILITY_CAMERA;
++      }
++      object->set_visibility(visibility);
++      object->set_use_holdout(use_holdout);
++      object->set_is_shadow_catcher(proto.is_shadow_catcher || instancer_shadow_catcher);
++      object->set_ao_distance(ao_distance);
++      object->set_is_caustics_caster(is_caustics_caster);
++      object->set_is_caustics_receiver(is_caustics_receiver);
++      object->set_shadow_terminator_shading_offset(shadow_terminator_shading_offset);
++      object->set_shadow_terminator_geometry_offset(shadow_terminator_geometry_offset);
++
++      /* No DupliObject to inherit from, so synthesize these. */
++      object->set_random_id(hash_uint2(i, 0));
++      object->set_dupli_generated(zero_float3());
++      object->set_dupli_uv(zero_float2());
++
++      /* Per-instance shader attributes. */
++      if (!instancer_attributes.empty()) {
++        object->attributes.clear();
++        for (const InstancerAttribute &attr : instancer_attributes) {
++          const blender::ColorGeometry4f c = attr.data[i];
++          const float4 value = make_float4(c.r, c.g, c.b, c.a);
++          object->attributes.push_back(ParamValue(attr.name, TypeFloat4, 1, &value));
++        }
++      }
++
++      /* Size the motion array now; motion passes fill it in later. */
++      if (scene->need_motion() != Scene::MOTION_NONE) {
++        sync_object_motion_init(b_ob, b_ob, object);
++      }
++
++      object->tag_update(scene);
++      slot++;
++    }
++  }
++
++  const double t_total = time_dt() - t_start;
++  LOG_INFO << "render-instances: " << num_instances << " instances -> " << slot
++           << " objects, " << num_references << " refs (" << num_empty_refs << " empty) in "
++           << t_total * 1000.0 << " ms (object_map " << t_map * 1000.0 << " ms, "
++           << (t_total > 0.0 ? 100.0 * t_map / t_total : 0.0) << "%; build "
++           << (t_total - t_map) * 1000.0 << " ms)";
++}
++
+ /* Object Loop */
+ 
+ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -475,6 +1239,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+     /* prepare for sync */
+     geometry_map.pre_sync();
+     object_map.pre_sync();
++    render_instances_pre_sync();
+     procedural_map.pre_sync();
+     particle_system_map.pre_sync();
+     motion_times.clear();
+@@ -522,6 +1287,16 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+       continue;
+     }
+ 
++    /* Render-instance source: build its instances directly from the evaluated
++     * geometry set, bypassing object_duplilist(). We do NOT continue here: the
++     * object may also carry realized geometry (e.g. Join Geometry of a ground
++     * mesh with the instances), which must still be synced by the normal path
++     * below. There is no double-up of the instances themselves, because the
++     * depsgraph iterator no longer expands duplis for this object. */
++    if (object_is_render_instancer(*b_ob)) {
++      sync_render_instances(b_depsgraph, b_view_layer, *b_ob, motion_time);
++    }
++
+     /* Load per-object culling data. */
+     culling.init_object(scene, *b_ob);
+ 
+@@ -566,6 +1341,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+ 
+   geom_task_pool.wait_work();
+ 
++  LOG_INFO << "render-instances: scene has " << scene->objects.size()
++           << " cycles objects after sync";
++
+   progress.set_sync_status("");
+ 
+   if (!cancel && !motion) {
+@@ -575,6 +1353,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+     /* Handle removed data and modified pointers, as this may free memory, delete Nodes in the
+      * right order to ensure that dependent data is freed after their users. Objects should be
+      * freed before particle systems and geometries. */
++    render_instances_post_sync();
+     object_map.post_sync();
+     geometry_map.post_sync();
+     particle_system_map.post_sync();
+diff --git a/intern/cycles/blender/session.cpp b/intern/cycles/blender/session.cpp
+index 66825b562c9..1927c8f2b6b 100644
+--- a/intern/cycles/blender/session.cpp
++++ b/intern/cycles/blender/session.cpp
+@@ -32,6 +32,7 @@
+ #include "util/path.h"
+ #include "util/progress.h"
+ #include "util/time.h"
++#include "util/update_timing.h"
+ 
+ #include "blender/display_driver.h"
+ #include "blender/output_driver.h"
+@@ -778,6 +779,11 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
+     return;
+   }
+ 
++  /* Phase 1 instrumentation: one event id per viewport sync, so every line
++   * logged during this update groups together. */
++  update_timing_event_id(true);
++  const UpdateScopedTimer timing_total("BlenderSession::synchronize TOTAL");
++
+   /* on session/scene parameter changes, we recreate session entirely */
+   const SessionParams session_params = BlenderSync::get_session_params(
+       b_engine, b_userpref, *b_scene, background, pixelsize);
+diff --git a/intern/cycles/blender/sync.cpp b/intern/cycles/blender/sync.cpp
+index 4560ba9d37f..b091832b55e 100644
+--- a/intern/cycles/blender/sync.cpp
++++ b/intern/cycles/blender/sync.cpp
+@@ -155,6 +155,18 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
+         object_map.set_recalc(b_ob);
+       }
+ 
++      /* Track render instancers separately: their instance objects live in
++       * flat per-instancer storage rather than object_map, so they need their
++       * own dirty signal to decide whether the per-instance loop can be
++       * skipped entirely. Without this, touching any object in the scene
++       * re-runs every instancer's loop. */
++      if ((b_id->recalc & (blender::ID_RECALC_GEOMETRY | blender::ID_RECALC_TRANSFORM |
++                           blender::ID_RECALC_SHADING)) != 0 ||
++          (b_ob->data && (b_ob->data->recalc & blender::ID_RECALC_ALL) != 0))
++      {
++        render_instances_recalc.insert(b_ob);
++      }
++
+       if (can_have_geometry || is_light) {
+         const bool updated_geometry = (b_id->recalc & blender::ID_RECALC_GEOMETRY) != 0 ||
+                                       (b_ob->data &&
+diff --git a/intern/cycles/blender/sync.h b/intern/cycles/blender/sync.h
+index 58a9269f1c4..09796d578c3 100644
+--- a/intern/cycles/blender/sync.h
++++ b/intern/cycles/blender/sync.h
+@@ -20,6 +20,9 @@
+ namespace blender {
+ struct DEGObjectIterData;
+ struct MeshSequenceCacheModifier;
++namespace bke {
++class InstanceReference;
++}
+ }  // namespace blender
+ 
+ CCL_NAMESPACE_BEGIN
+@@ -178,6 +181,59 @@ class BlenderSync {
+                               blender::DEGObjectIterData &b_deg_iter_data,
+                               Object *object);
+ 
++  /* Render instances: build instance objects directly from the instances
++   * geometry nodes already produced, bypassing object_duplilist.
++   * See object.cpp. */
++  bool object_is_render_instancer(blender::Object &b_ob);
++  void sync_render_instances(blender::Depsgraph &b_depsgraph,
++                             blender::ViewLayer &b_view_layer,
++                             blender::Object &b_ob,
++                             float motion_time);
++
++  /* Instance objects are held in a flat array per instancer rather than in
++   * object_map. object_map is an ordered map whose per-instance lookup cost
++   * dominates instance sync at scale (~80% of the loop at 490k), and indexing
++   * a vector by instance index is O(1). It also lets an unchanged instancer be
++   * kept alive in bulk instead of re-marking every object as used. */
++  struct RenderInstanceSet {
++    vector<Object *> objects;
++    /* One prototype Object per group member, reused across syncs by index so a
++     * steady-state re-sync does not churn them. M of these, against
++     * `objects` which is currently N * M. */
++    vector<Object *> prototypes;
++    bool used = false;
++  };
++
++  /* One reference can expand to several pieces of geometry: a collection
++   * reference yields one per member, and a geometry set may hold nested
++   * instances. Each entry carries the geometry plus its transform relative to
++   * the instance. */
++  struct RenderInstanceProto {
++    Geometry *geometry;
++    Transform local;
++    /* Ray visibility of the prototype itself; combined with the instancer's. */
++    PathRayVisibility visibility;
++    bool is_shadow_catcher;
++  };
++  void render_instances_collect_prototypes(const blender::bke::InstanceReference &b_reference,
++                                           const Transform &local,
++                                           blender::Object &b_instancer,
++                                           vector<RenderInstanceProto> &r_protos,
++                                           int depth);
++  map<void *, RenderInstanceSet> render_instance_sets;
++  /* Instancers whose transform/geometry/shading the depsgraph tagged this
++   * update. Populated in sync_recalc, consumed in sync_render_instances so an
++   * untouched instancer can skip its whole per-instance loop, and cleared in
++   * render_instances_post_sync. */
++  set<void *> render_instances_recalc;
++  /* An instancer this sync could not express as a group -- emissive or volume
++   * geometry in a prototype. Groups are disabled scene-wide when set, because
++   * leaving them half-built means the device would trace group structures and
++   * the expanded flat objects at once. */
++  bool render_instances_groups_unsafe = false;
++  void render_instances_pre_sync();
++  void render_instances_post_sync();
++
+   /* Volume */
+   void sync_volume(BObjectInfo &b_ob_info, Volume *volume);
+ 
+diff --git a/intern/cycles/bvh/bvh.cpp b/intern/cycles/bvh/bvh.cpp
+index 12466f5703f..57869ebbb35 100644
+--- a/intern/cycles/bvh/bvh.cpp
++++ b/intern/cycles/bvh/bvh.cpp
+@@ -40,6 +40,8 @@ const char *bvh_layout_name(BVHLayout layout)
+       return "EMBREE";
+     case BVH_LAYOUT_OPTIX:
+       return "OPTIX";
++    case BVH_LAYOUT_OPTIX_NESTED:
++      return "OPTIX_NESTED";
+     case BVH_LAYOUT_METAL:
+       return "METAL";
+     case BVH_LAYOUT_HIPRT:
+@@ -110,6 +112,7 @@ unique_ptr<BVH> BVH::create(const BVHParams &params,
+       break;
+ #endif
+     case BVH_LAYOUT_OPTIX:
++    case BVH_LAYOUT_OPTIX_NESTED:
+ #ifdef WITH_OPTIX
+       return make_unique<BVHOptiX>(params, geometry, objects, device);
+ #else
+diff --git a/intern/cycles/bvh/bvh.h b/intern/cycles/bvh/bvh.h
+index 6ce30c81fdc..488261ccbf7 100644
+--- a/intern/cycles/bvh/bvh.h
++++ b/intern/cycles/bvh/bvh.h
+@@ -64,12 +64,22 @@ struct PackedBVH {
+ 
+ /* BVH */
+ 
++class ObjectGroup;
++struct ObjectGroupInstance;
++
+ class BVH {
+  public:
+   BVHParams params;
+   vector<Geometry *> geometry;
+   vector<Object *> objects;
+ 
++  /* Object groups, for backends that can build a nested acceleration structure.
++   * Borrowed from the Scene, which owns them and rebuilds them each sync, so
++   * these are only valid during a build. Null when the scene has no groups or
++   * the backend cannot use them. */
++  const vector<ObjectGroup> *object_groups = nullptr;
++  const vector<ObjectGroupInstance> *object_group_instances = nullptr;
++
+   static unique_ptr<BVH> create(const BVHParams &params,
+                                 const vector<Geometry *> &geometry,
+                                 const vector<Object *> &objects,
+diff --git a/intern/cycles/bvh/optix.h b/intern/cycles/bvh/optix.h
+index 07956e2b428..77259670cbd 100644
+--- a/intern/cycles/bvh/optix.h
++++ b/intern/cycles/bvh/optix.h
+@@ -23,6 +23,14 @@ class BVHOptiX : public BVH {
+   unique_ptr<device_only_memory<char>> as_data;
+   unique_ptr<device_only_memory<char>> motion_transform_data;
+ 
++  /* Intermediate instance acceleration structures, one per object group, sitting
++   * between the top level and the geometry.
++   *
++   * Held here rather than leaked at build time: OptiXDevice::release_bvh hands
++   * these to the delayed-free list along with as_data, so they are released
++   * once the GPU is no longer reading them. */
++  vector<unique_ptr<device_only_memory<char>>> nested_as_data;
++
+   BVHOptiX(const BVHParams &params,
+            const vector<Geometry *> &geometry,
+            const vector<Object *> &objects,
+diff --git a/intern/cycles/device/optix/device_impl.cpp b/intern/cycles/device/optix/device_impl.cpp
+index 6eac001711f..f0a8e93e3e1 100644
+--- a/intern/cycles/device/optix/device_impl.cpp
++++ b/intern/cycles/device/optix/device_impl.cpp
+@@ -23,6 +23,7 @@
+ #  include "util/path.h"
+ #  include "util/progress.h"
+ #  include "util/task.h"
++#  include "util/update_timing.h"
+ 
+ #  define __KERNEL_OPTIX__
+ #  include "kernel/device/optix/globals.h"
+@@ -165,8 +166,13 @@ unique_ptr<DeviceQueue> OptiXDevice::gpu_queue_create()
+ 
+ BVHLayoutMask OptiXDevice::get_bvh_layout_mask(uint /*kernel_features*/) const
+ {
+-  /* OptiX has its own internal acceleration structure format. */
+-  return BVH_LAYOUT_OPTIX;
++  /* OptiX has its own internal acceleration structure format.
++   *
++   * Advertising the nested bit as well makes BVHParams::best_bvh_layout pick it
++   * automatically: the requested layout (EMBREE) is unsupported here, so it
++   * takes the highest supported bit, which is the nested one. Other devices are
++   * untouched. */
++  return BVH_LAYOUT_OPTIX | BVH_LAYOUT_OPTIX_NESTED;
+ }
+ 
+ static string get_optix_include_dir()
+@@ -387,11 +393,17 @@ bool OptiXDevice::load_kernels(const uint kernel_features)
+   module_options.payloadTypes = nullptr;
+   module_options.numPayloadTypes = 0;
+ 
+-  /* Default to no motion blur and two-level graph, since it is the fastest option. */
++  /* Nested instancing puts an intermediate IAS between the top level and the
++   * geometry, so the graph is no longer two-level and ALLOW_ANY is required.
++   * There is no "three level" flag; ALLOW_ANY is the only option permitting it.
++   * Motion blur already forced this same flag, so the configuration is not new,
++   * but it is now the default rather than the exception -- the cost to scenes
++   * that do not nest is to be measured, not assumed. */
+   pipeline_options.usesMotionBlur = false;
+-  pipeline_options.traversableGraphFlags =
+-      OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
+-  pipeline_options.numPayloadValues = 8;
++  pipeline_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
++  /* One more than the eight originally used: the ninth carries the object group
++   * placement id, which cannot share a register with the object id. */
++  pipeline_options.numPayloadValues = 9;
+   pipeline_options.numAttributeValues = 2; /* u, v */
+   pipeline_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
+   pipeline_options.pipelineLaunchParamsVariableName = "kernel_params"; /* See globals.h */
+@@ -844,7 +856,7 @@ bool OptiXDevice::load_kernels(const uint kernel_features)
+ 
+     /* Set stack size depending on pipeline options. */
+     optix_assert(optixPipelineSetStackSize(
+-        pipelines[PIP_SHADE], 0, dss, css, pipeline_options.usesMotionBlur ? 3 : 2));
++        pipelines[PIP_SHADE], 0, dss, css, pipeline_options.usesMotionBlur ? 4 : 3));
+   }
+ 
+   { /* Create intersection-only pipeline. */
+@@ -903,7 +915,7 @@ bool OptiXDevice::load_kernels(const uint kernel_features)
+         link_options.maxTraceDepth * trace_css;
+ 
+     optix_assert(optixPipelineSetStackSize(
+-        pipelines[PIP_INTERSECT], 0, 0, css, pipeline_options.usesMotionBlur ? 3 : 2));
++        pipelines[PIP_INTERSECT], 0, 0, css, pipeline_options.usesMotionBlur ? 4 : 3));
+   }
+ 
+   return !have_error();
+@@ -1216,7 +1228,7 @@ bool OptiXDevice::load_osl_kernels()
+     }
+ 
+     optix_assert(optixPipelineSetStackSize(
+-        pipelines[PIP_SHADE], 0, dss, css, pipeline_options.usesMotionBlur ? 3 : 2));
++        pipelines[PIP_SHADE], 0, dss, css, pipeline_options.usesMotionBlur ? 4 : 3));
+   }
+ 
+   /* Copy colorsystem data from OSL to the device. */
+@@ -1273,6 +1285,48 @@ OSLGlobals *OptiXDevice::get_cpu_osl_memory()
+ #  endif
+ }
+ 
++OptixTraversableHandle OptiXDevice::build_nested_ias(
++    const OptixBuildInput &build_input, unique_ptr<device_only_memory<char>> &r_data)
++{
++  const CUDAContextScope scope(this);
++
++  OptixAccelBuildOptions options = {};
++  options.operation = OPTIX_BUILD_OPERATION_BUILD;
++  options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
++
++  OptixAccelBufferSizes sizes = {};
++  optix_assert(optixAccelComputeMemoryUsage(context, &options, &build_input, 1, &sizes));
++
++  device_only_memory<char> temp_mem(this, "optix nested as temp", true);
++  temp_mem.alloc_to_device(sizes.tempSizeInBytes);
++  if (!temp_mem.device_pointer) {
++    return 0;
++  }
++
++  r_data = make_unique<device_only_memory<char>>(this, "optix nested as", false);
++  r_data->alloc_to_device(sizes.outputSizeInBytes);
++  if (!r_data->device_pointer) {
++    return 0;
++  }
++
++  OptixTraversableHandle handle = 0;
++  optix_assert(optixAccelBuild(context,
++                               nullptr,
++                               &options,
++                               &build_input,
++                               1,
++                               temp_mem.device_pointer,
++                               sizes.tempSizeInBytes,
++                               r_data->device_pointer,
++                               sizes.outputSizeInBytes,
++                               &handle,
++                               nullptr,
++                               0));
++  cuda_assert(cuStreamSynchronize(nullptr));
++
++  return handle;
++}
++
+ bool OptiXDevice::build_optix_bvh(BVHOptiX *bvh,
+                                   OptixBuildOperation operation,
+                                   const OptixBuildInput &build_input,
+@@ -1744,9 +1798,34 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
+       return;
+     }
+ 
+-    /* Fill instance descriptions. */
++    /* Phase 1 instrumentation. Note that `refit` is computed and passed in by
++     * GeometryManager::device_update_bvh, but this top-level branch ignores it
++     * and always does a full OPTIX_BUILD_OPERATION_BUILD. */
++    update_timing_log(
++        "      TLAS: objects=%zu  OptixInstance=%zu B  array=%.1f MB  refit_requested=%d",
++        bvh->objects.size(),
++        sizeof(OptixInstance),
++        double(bvh->objects.size() * sizeof(OptixInstance)) / (1024.0 * 1024.0),
++        int(refit));
++    const UpdateScopedTimer timing_tlas("      TLAS TOTAL");
++    const double timing_fill_start = time_dt();
++
++    /* Experimental: one intermediate IAS per object group, SHARED by every
++     * placement of that group. This is what turns N * M instance records into
++     * N + M. Opt-in until identity resolution is finished.
++     * Set CYCLES_NESTED_SHARED to measure the collapse. */
++    const bool use_shared_groups = (getenv("CYCLES_NESTED_SHARED") != nullptr);
++    const bool build_groups = use_shared_groups &&
++                              bvh->params.bvh_layout == BVH_LAYOUT_OPTIX_NESTED &&
++                              bvh->object_groups != nullptr && !bvh->object_groups->empty() &&
++                              bvh->object_group_instances != nullptr &&
++                              !bvh->object_group_instances->empty();
++
++    /* Fill instance descriptions. Room for the flat objects plus one entry per
++     * group placement, which are appended below. */
+     device_vector<OptixInstance> instances(this, "optix tlas instances", MEM_READ_ONLY);
+-    instances.alloc(bvh->objects.size());
++    instances.alloc(bvh->objects.size() +
++                    (build_groups ? bvh->object_group_instances->size() : 0));
+ 
+     /* Calculate total motion transform size and allocate memory for them. */
+     size_t motion_transform_offset = 0;
+@@ -1772,6 +1851,11 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
+       if (!ob->is_traceable()) {
+         continue;
+       }
++      /* A group's members are reached through the group's own structure, so
++       * their expanded copies must not also appear here. */
++      if (build_groups && ob->is_group_expanded) {
++        continue;
++      }
+ 
+       BVHOptiX *const blas = static_cast<BVHOptiX *>(ob->get_geometry()->bvh.get());
+       OptixTraversableHandle handle = blas->traversable_handle;
+@@ -1921,18 +2005,202 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
+       }
+     }
+ 
+-    /* Upload instance descriptions. */
+-    instances.resize(num_instances);
+-    instances.copy_to_device();
++    update_timing_log("      TLAS: fill instance array (%u traceable) %8.2f ms",
++                      num_instances,
++                      (time_dt() - timing_fill_start) * 1000.0);
+ 
+-    /* Build top-level acceleration structure (TLAS) */
++    /* Build top-level acceleration structure (TLAS). The array is uploaded
++     * below, once the group path has had a chance to append placements to it. */
+     OptixBuildInput build_input = {};
+     build_input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+-    build_input.instanceArray.instances = instances.device_pointer;
+-    build_input.instanceArray.numInstances = num_instances;
+ 
+-    if (!build_optix_bvh(bvh_optix, OPTIX_BUILD_OPERATION_BUILD, build_input, 0)) {
+-      progress.set_error("Failed to build OptiX acceleration structure");
++    /* Three-level graph: top level -> intermediate IAS -> geometry.
++     *
++     * The intermediate currently holds every instance and the top level holds a
++     * single identity instance over it, so the composed transform is
++     * identity * object and the innermost instance id is still the object
++     * index. That renders identically to the flat path while exercising the
++     * whole mechanism: three-level traversal, SBT offsets summing across
++     * levels, and the lifetime of the intermediate structure.
++     *
++     * Splitting the intermediate per object group is what turns N * M instance
++     * records into N + M, and needs the two instance ids resolved separately. */
++    device_vector<OptixInstance> root(this, "optix tlas root", MEM_READ_ONLY);
++
++    if (build_groups) {
++      const vector<ObjectGroup> &groups = *bvh->object_groups;
++      const vector<ObjectGroupInstance> &group_instances = *bvh->object_group_instances;
++      const UpdateScopedTimer t("      TLAS: build shared group IASes");
++
++      /* One IAS per group, built once and shared by every placement. */
++      vector<OptixTraversableHandle> group_handles(groups.size(), 0);
++      size_t total_members = 0;
++      /* Index into the flat group_members array the kernel reads, which spans
++       * every group. A member's index WITHIN its group is not usable here: with
++       * more than one group every group after the first would resolve to the
++       * wrong group's prototype. It must advance for every member, including
++       * ones skipped below for having no geometry, or it drifts out of step
++       * with how the array is filled. */
++      unsigned int global_member = 0;
++      for (size_t g = 0; g < groups.size(); g++) {
++        const ObjectGroup &group = groups[g];
++        if (group.members.empty()) {
++          continue;
++        }
++        device_vector<OptixInstance> members(this, "optix group members", MEM_READ_ONLY);
++        members.alloc(group.members.size());
++        unsigned int num_members = 0;
++
++        for (size_t m = 0; m < group.members.size(); m++) {
++          const ObjectGroupMember &member = group.members[m];
++          const unsigned int member_index = global_member++;
++          if (member.geometry == nullptr || member.geometry->bvh == nullptr) {
++            continue;
++          }
++          const BVHOptiX *const blas = static_cast<const BVHOptiX *>(member.geometry->bvh.get());
++          if (blas->traversable_handle == 0) {
++            continue;
++          }
++          OptixInstance &mi = members[num_members++];
++          memset(&mi, 0, sizeof(mi));
++          /* Group-local; OptiX composes the world transform from this and the
++           * placement transform above it. */
++          memcpy(mi.transform, &member.local, sizeof(mi.transform));
++          /* Member index within the group, flagged so every hit program can
++           * tell a group member from a plain object without inferring it from
++           * the traversal shape. Resolved through group_members. */
++          mi.instanceId = member_index | OBJECT_GROUP_MEMBER_FLAG;
++          mi.visibilityMask = (member.visibility & 0xFF) ? (member.visibility & 0xFF) : 0xFF;
++          /* Geometry-type offset belongs on this level; OptiX sums offsets down
++           * the chain and the placement above contributes 0. */
++          mi.sbtOffset = 0;
++          if (member.geometry->is_hair()) {
++            const Hair *hair = static_cast<const Hair *>(member.geometry);
++            if (hair->curve_shape == CURVE_RIBBON) {
++              mi.sbtOffset = PG_HITD_CURVE_RIBBON - PG_HITD;
++              mi.visibilityMask |= 4;
++            }
++            else if (hair->curve_shape == CURVE_THICK_LINEAR) {
++              mi.sbtOffset = PG_HITD_CURVE_LINEAR - PG_HITD;
++            }
++          }
++          else if (member.geometry->is_pointcloud()) {
++            mi.sbtOffset = PG_HITD_POINTCLOUD - PG_HITD;
++            mi.visibilityMask |= 4;
++          }
++          mi.flags = OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT;
++          mi.traversableHandle = blas->traversable_handle;
++        }
++
++        if (num_members == 0) {
++          continue;
++        }
++        members.resize(num_members);
++        members.copy_to_device();
++        total_members += num_members;
++
++        OptixBuildInput group_input = {};
++        group_input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
++        group_input.instanceArray.instances = members.device_pointer;
++        group_input.instanceArray.numInstances = num_members;
++
++        unique_ptr<device_only_memory<char>> group_data;
++        group_handles[g] = build_nested_ias(group_input, group_data);
++        if (group_handles[g] == 0) {
++          progress.set_error("Failed to build group acceleration structure");
++          return;
++        }
++        bvh_optix->nested_as_data.push_back(std::move(group_data));
++      }
++
++      /* Append one top-level instance per placement, alongside the flat objects
++       * already filled in above. */
++      const unsigned int num_flat = num_instances;
++      for (size_t i = 0; i < group_instances.size(); i++) {
++        const ObjectGroupInstance &instance = group_instances[i];
++        if (instance.group < 0 || (size_t)instance.group >= group_handles.size() ||
++            group_handles[instance.group] == 0)
++        {
++          continue;
++        }
++        OptixInstance &gi = instances[num_instances++];
++        memset(&gi, 0, sizeof(gi));
++        memcpy(gi.transform, &instance.tfm, sizeof(gi.transform));
++        gi.instanceId = (unsigned int)i;
++        /* Never cull here: the mask is tested independently per level, so the
++         * combined mask lives on the members and this level must pass
++         * everything through. */
++        gi.visibilityMask = 0xFF;
++        gi.sbtOffset = 0;
++        gi.flags = OPTIX_INSTANCE_FLAG_NONE;
++        gi.traversableHandle = group_handles[instance.group];
++      }
++
++      update_timing_log(
++          "      NESTED SHARED: %zu groups, %zu members + %u placements = %zu records "
++          "(+%u flat objects kept)",
++          groups.size(),
++          total_members,
++          num_instances - num_flat,
++          total_members + (num_instances - num_flat),
++          num_flat);
++    }
++    else if (bvh->params.bvh_layout == BVH_LAYOUT_OPTIX_NESTED && num_instances > 0) {
++      const UpdateScopedTimer t("      TLAS: build intermediate IAS");
++
++      /* This path consumes the instance array directly, so it must be on the
++       * device before the intermediate structure is built over it. */
++      instances.resize(num_instances);
++      instances.copy_to_device();
++      build_input.instanceArray.instances = instances.device_pointer;
++      build_input.instanceArray.numInstances = num_instances;
++
++      unique_ptr<device_only_memory<char>> nested_data;
++      const OptixTraversableHandle nested_handle = build_nested_ias(build_input, nested_data);
++      if (nested_handle == 0) {
++        progress.set_error("Failed to build nested OptiX acceleration structure");
++        return;
++      }
++      bvh_optix->nested_as_data.push_back(std::move(nested_data));
++
++      /* sbtOffset stays 0: OptiX sums offsets down the chain, so the
++       * per-geometry-type offset already on the inner instances is what selects
++       * the hit group. visibilityMask is 0xFF because each level is tested
++       * independently and the inner mask is the real one. Flags are NONE
++       * because DISABLE_ANYHIT here would apply to the whole subtree. */
++      root.alloc(1);
++      OptixInstance &root_instance = root[0];
++      memset(&root_instance, 0, sizeof(root_instance));
++      root_instance.transform[0] = 1.0f;
++      root_instance.transform[5] = 1.0f;
++      root_instance.transform[10] = 1.0f;
++      root_instance.instanceId = 0;
++      root_instance.visibilityMask = 0xFF;
++      root_instance.sbtOffset = 0;
++      root_instance.flags = OPTIX_INSTANCE_FLAG_NONE;
++      root_instance.traversableHandle = nested_handle;
++      root.copy_to_device();
++
++      build_input.instanceArray.instances = root.device_pointer;
++      build_input.instanceArray.numInstances = 1;
++    }
++
++    /* Upload once the array is complete. */
++    instances.resize(num_instances);
++    {
++      const UpdateScopedTimer t("      TLAS: upload instance array");
++      instances.copy_to_device();
++    }
++    if (build_input.instanceArray.instances == 0) {
++      build_input.instanceArray.instances = instances.device_pointer;
++      build_input.instanceArray.numInstances = num_instances;
++    }
++
++    {
++      const UpdateScopedTimer t("      TLAS: optixAccelBuild (full rebuild)");
++      if (!build_optix_bvh(bvh_optix, OPTIX_BUILD_OPERATION_BUILD, build_input, 0)) {
++        progress.set_error("Failed to build OptiX acceleration structure");
++      }
+     }
+     tlas_handle = bvh_optix->traversable_handle;
+   }
+@@ -1947,6 +2215,13 @@ void OptiXDevice::release_bvh(BVH *bvh)
+ 
+   delayed_free_bvh_memory.emplace_back(std::move(bvh_optix->as_data));
+   delayed_free_bvh_memory.emplace_back(std::move(bvh_optix->motion_transform_data));
++  /* Intermediate structures go the same way. An earlier prototype of this
++   * feature pushed them onto a list nothing ever freed, so every rebuild
++   * leaked one. */
++  for (unique_ptr<device_only_memory<char>> &nested : bvh_optix->nested_as_data) {
++    delayed_free_bvh_memory.emplace_back(std::move(nested));
++  }
++  bvh_optix->nested_as_data.clear();
+   bvh_optix->traversable_handle = 0;
+ }
+ 
+diff --git a/intern/cycles/device/optix/device_impl.h b/intern/cycles/device/optix/device_impl.h
+index 98eaca56a71..0f5f9742abf 100644
+--- a/intern/cycles/device/optix/device_impl.h
++++ b/intern/cycles/device/optix/device_impl.h
+@@ -140,6 +140,12 @@ class OptiXDevice : public CUDADevice {
+ 
+   bool load_osl_kernels() override;
+ 
++  /* Build an intermediate instance acceleration structure, sitting between the
++   * top level and the geometry. Ownership of the device memory is handed to the
++   * caller, which stores it on the BVH so release_bvh can free it. */
++  OptixTraversableHandle build_nested_ias(const OptixBuildInput &build_input,
++                                          unique_ptr<device_only_memory<char>> &r_data);
++
+   bool build_optix_bvh(BVHOptiX *bvh,
+                        OptixBuildOperation operation,
+                        const OptixBuildInput &build_input,
+diff --git a/intern/cycles/kernel/bvh/intersect_filter.h b/intern/cycles/kernel/bvh/intersect_filter.h
+index 2494ce711b7..e6701750259 100644
+--- a/intern/cycles/kernel/bvh/intersect_filter.h
++++ b/intern/cycles/kernel/bvh/intersect_filter.h
+@@ -154,7 +154,7 @@ ccl_device_forceinline bool bvh_shadow_all_anyhit_filter(
+ #endif
+ 
+   if constexpr ((perform_intersection_tests & ISECT_TEST_SELF_SHADOW) != 0) {
+-    if (intersection_skip_self_shadow(ray_self, isect.object, isect.prim)) {
++    if (intersection_skip_self_shadow(ray_self, isect.object, isect.prim, isect.instance)) {
+       return true;
+     }
+   }
+diff --git a/intern/cycles/kernel/bvh/traversal.h b/intern/cycles/kernel/bvh/traversal.h
+index 88216ca200f..508f33356b6 100644
+--- a/intern/cycles/kernel/bvh/traversal.h
++++ b/intern/cycles/kernel/bvh/traversal.h
+@@ -53,6 +53,7 @@ ccl_device_noinline bool BVH_FUNCTION_FULL_NAME(BVH)(KernelGlobals kg,
+   isect->v = 0.0f;
+   isect->prim = PRIM_NONE;
+   isect->object = OBJECT_NONE;
++  isect->instance = OBJECT_NONE;
+ 
+   /* traversal loop */
+   do {
+diff --git a/intern/cycles/kernel/bvh/util.h b/intern/cycles/kernel/bvh/util.h
+index be5c42c8868..9d52a9e3b30 100644
+--- a/intern/cycles/kernel/bvh/util.h
++++ b/intern/cycles/kernel/bvh/util.h
+@@ -239,16 +239,18 @@ ccl_device_inline float intersection_curve_shadow_transparency(
+ 
+ ccl_device_inline bool intersection_skip_self(const ccl_ray_data RaySelfPrimitives &self,
+                                               const int object,
+-                                              const int prim)
++                                              const int prim,
++                                              const int instance = OBJECT_NONE)
+ {
+-  return (self.prim == prim) && (self.object == object);
++  return (self.prim == prim) && (self.object == object) && (self.instance == instance);
+ }
+ 
+ ccl_device_inline bool intersection_skip_self_shadow(const ccl_ray_data RaySelfPrimitives &self,
+                                                      const int object,
+-                                                     const int prim)
++                                                     const int prim,
++                                                     const int instance = OBJECT_NONE)
+ {
+-  return ((self.prim == prim) && (self.object == object)) ||
++  return ((self.prim == prim) && (self.object == object) && (self.instance == instance)) ||
+          ((self.light_prim == prim) && (self.light_object == object));
+ }
+ 
+diff --git a/intern/cycles/kernel/bvh/volume.h b/intern/cycles/kernel/bvh/volume.h
+index b2529b3087c..bd15ce48b72 100644
+--- a/intern/cycles/kernel/bvh/volume.h
++++ b/intern/cycles/kernel/bvh/volume.h
+@@ -57,6 +57,7 @@ ccl_device_inline
+   isect->v = 0.0f;
+   isect->prim = PRIM_NONE;
+   isect->object = OBJECT_NONE;
++  isect->instance = OBJECT_NONE;
+ 
+   /* traversal loop */
+   do {
+diff --git a/intern/cycles/kernel/data_arrays.h b/intern/cycles/kernel/data_arrays.h
+index 766f1971fbf..6da21101a22 100644
+--- a/intern/cycles/kernel/data_arrays.h
++++ b/intern/cycles/kernel/data_arrays.h
+@@ -26,6 +26,8 @@ KERNEL_DATA_ARRAY(KernelObject, objects)
+ KERNEL_DATA_ARRAY(Transform, object_motion_pass)
+ KERNEL_DATA_ARRAY(DecomposedTransform, object_motion)
+ KERNEL_DATA_ARRAY(uint, object_flag)
++KERNEL_DATA_ARRAY(KernelGroupMember, group_members)
++KERNEL_DATA_ARRAY(KernelGroupPlacement, group_placements)
+ KERNEL_DATA_ARRAY(uint, object_prim_offset)
+ 
+ /* cameras */
+diff --git a/intern/cycles/kernel/data_template.h b/intern/cycles/kernel/data_template.h
+index b1333a8a8b0..b4f42518968 100644
+--- a/intern/cycles/kernel/data_template.h
++++ b/intern/cycles/kernel/data_template.h
+@@ -52,6 +52,9 @@ KERNEL_STRUCT_BEGIN(KernelBVH, bvh)
+ KERNEL_STRUCT_MEMBER(bvh, int, root)
+ KERNEL_STRUCT_MEMBER(bvh, int, have_motion)
+ KERNEL_STRUCT_MEMBER(bvh, int, have_curves)
++/* Object groups are in use, so a hit with two instance levels resolves
++ * through group_members and group_placements rather than directly. */
++KERNEL_STRUCT_MEMBER(bvh, int, use_object_groups)
+ KERNEL_STRUCT_MEMBER(bvh, int, have_points)
+ KERNEL_STRUCT_MEMBER(bvh, int, have_volumes)
+ KERNEL_STRUCT_MEMBER(bvh, int, bvh_layout)
+diff --git a/intern/cycles/kernel/device/cpu/bvh.h b/intern/cycles/kernel/device/cpu/bvh.h
+index 8b7c3de35c0..465f95e88f9 100644
+--- a/intern/cycles/kernel/device/cpu/bvh.h
++++ b/intern/cycles/kernel/device/cpu/bvh.h
+@@ -160,6 +160,7 @@ ccl_device_inline void kernel_embree_convert_hit(KernelGlobals kg,
+   isect->t = ray->tfar;
+   isect->prim = hit->primID + prim_offset;
+   isect->object = kernel_embree_get_hit_object(hit);
++  isect->instance = OBJECT_NONE;
+ 
+   const bool is_hair = hit->geomID & 1;
+   if (is_hair) {
+@@ -206,6 +207,7 @@ ccl_device_inline void kernel_embree_convert_sss_hit(KernelGlobals kg,
+   isect->t = ray->tfar;
+   isect->prim = hit->primID + prim_offset;
+   isect->object = object;
++  isect->instance = OBJECT_NONE;
+   isect->type = kernel_data_fetch(objects, object).primitive_type;
+ }
+ 
+diff --git a/intern/cycles/kernel/device/hiprt/bvh.h b/intern/cycles/kernel/device/hiprt/bvh.h
+index aea888016c5..4943a0efefd 100644
+--- a/intern/cycles/kernel/device/hiprt/bvh.h
++++ b/intern/cycles/kernel/device/hiprt/bvh.h
+@@ -39,6 +39,7 @@ ccl_device_inline void set_intersect_point(const hiprtHit &hit, ccl_private Inte
+   isect->v = hit.uv.y;
+ 
+   isect->object = object;
++  isect->instance = OBJECT_NONE;
+   isect->type = kernel_data_fetch(objects, object).primitive_type;
+ 
+   if (isect->type & PRIMITIVE_CURVE) {
+@@ -408,6 +409,7 @@ ccl_device_inline bool local_intersection_filter(const hiprtRay &ray,
+   isect->v = hit.uv.y;
+   isect->prim = prim;
+   isect->object = object_id;
++  isect->instance = OBJECT_NONE;
+   isect->type = primitive_type;
+ 
+   payload->local_isect->Ng[hit_index] = hit.normal;
+@@ -509,6 +511,7 @@ ccl_device_intersect bool scene_intersect(KernelGlobals kg,
+   isect->v = 0.0f;
+   isect->prim = PRIM_NONE;
+   isect->object = OBJECT_NONE;
++  isect->instance = OBJECT_NONE;
+   isect->type = PRIMITIVE_NONE;
+   if (!intersection_ray_valid(ray)) {
+     isect->t = ray->tmax;
+@@ -699,6 +702,7 @@ ccl_device_intersect bool scene_intersect_volume(KernelGlobals kg,
+   isect->v = 0.0f;
+   isect->prim = PRIM_NONE;
+   isect->object = OBJECT_NONE;
++  isect->instance = OBJECT_NONE;
+   isect->type = PRIMITIVE_NONE;
+ 
+   if (!intersection_ray_valid(ray)) {
+diff --git a/intern/cycles/kernel/device/metal/bvh.h b/intern/cycles/kernel/device/metal/bvh.h
+index f47d2824f6c..3c33a473df5 100644
+--- a/intern/cycles/kernel/device/metal/bvh.h
++++ b/intern/cycles/kernel/device/metal/bvh.h
+@@ -212,6 +212,7 @@ ccl_device_intersect bool scene_intersect(KernelGlobals kg,
+   }
+ 
+   isect->object = intersection.instance_id;
++  isect->instance = OBJECT_NONE;
+   isect->t = intersection.distance;
+   if (intersection.type == intersection_type::triangle) {
+     isect->prim = intersection.primitive_id + intersection.user_instance_id;
+@@ -563,6 +564,7 @@ ccl_device_intersect bool scene_intersect_volume(KernelGlobals kg,
+     isect->u = intersection.triangle_barycentric_coord.x;
+     isect->v = intersection.triangle_barycentric_coord.y;
+     isect->object = intersection.instance_id;
++    isect->instance = OBJECT_NONE;
+     isect->t = intersection.distance;
+     return true;
+   }
+diff --git a/intern/cycles/kernel/device/metal/kernel.metal b/intern/cycles/kernel/device/metal/kernel.metal
+index 65207fd5a59..2a4a8ebaec3 100644
+--- a/intern/cycles/kernel/device/metal/kernel.metal
++++ b/intern/cycles/kernel/device/metal/kernel.metal
+@@ -185,6 +185,7 @@ inline Intersection get_intersection(constant KernelParamsMetal &launch_params_m
+   isect.v = uv.y;
+   isect.prim = prim;
+   isect.object = object;
++  isect.instance = OBJECT_NONE;
+   isect.type = kernel_data_fetch(objects, object).primitive_type;
+ 
+ #  ifdef __HAIR__
+diff --git a/intern/cycles/kernel/device/optix/bvh.h b/intern/cycles/kernel/device/optix/bvh.h
+index c079bb48faf..abc576f9404 100644
+--- a/intern/cycles/kernel/device/optix/bvh.h
++++ b/intern/cycles/kernel/device/optix/bvh.h
+@@ -38,15 +38,89 @@ template<typename T> ccl_device_forceinline T *get_payload_ptr_6()
+   return (T *)(((uint64_t)optixGetPayload_7() << 32) | optixGetPayload_6());
+ }
+ 
++/* Instance ids along the traversal chain.
++ *
++ * OptiX orders the transform list outermost first: index 0 is the TLAS-level
++ * entry and the last index sits closest to the geometry. Motion transform nodes
++ * appear in that list too and carry no instance id of their own, so they are
++ * skipped rather than assumed absent.
++ *
++ * With a single level of instancing the outer and inner instance are the same
++ * OptixInstance, so both accessors below return exactly what this file has
++ * always returned. They are separate because they stop agreeing the moment a
++ * second instancing level exists, and naming the level at each call site is
++ * safer than a compile-time branch that silently selects a different one.
++ * (The previous code did exactly that: the __OBJECT_MOTION__ branch read the
++ * outermost instance and the other branch read the innermost.) */
++
++ccl_device_forceinline int get_instance_id_at(const unsigned int index)
++{
++  const OptixTraversableHandle handle = optixGetTransformListHandle(index);
++  if (optixGetTransformTypeFromHandle(handle) != OPTIX_TRANSFORM_TYPE_INSTANCE) {
++    /* A motion transform node: real traversal step, but not an instance. */
++    return -1;
++  }
++  return (int)optixGetInstanceIdFromHandle(handle);
++}
++
++/* Outermost instance in the chain, i.e. the one referenced by the TLAS. Under
++ * nested instancing this is the group instance; today it is the object. */
++ccl_device_forceinline int get_object_id_outer()
++{
++  const unsigned int size = optixGetTransformListSize();
++  for (unsigned int i = 0; i < size; i++) {
++    const int id = get_instance_id_at(i);
++    if (id >= 0) {
++      return id;
++    }
++  }
++  /* No instance in the chain, e.g. a single GAS. */
++  return (int)optixGetInstanceId();
++}
++
++/* Innermost instance, i.e. the one directly above the geometry. Under nested
++ * instancing this is the group member; today it is the object.
++ *
++ * optixGetInstanceId() returns the most recently visited OptixInstance, and a
++ * motion transform is not an instance, so this is already the innermost one. */
++ccl_device_forceinline int get_object_id_inner()
++{
++  return (int)optixGetInstanceId();
++}
++
++/* Whether this hit came through an object group.
++ *
++ * Read from a flag bit the group builder sets on member instance ids, so every
++ * hit program agrees. Counting instancing levels instead was fragile: it had to
++ * behave identically in every program and traversal path, and where it did not,
++ * the same surface resolved two different ways depending on which ray hit it. */
++ccl_device_forceinline bool is_object_group_hit()
++{
++  return (optixGetInstanceId() & OBJECT_GROUP_MEMBER_FLAG) != 0;
++}
++
++/* The Cycles object index for this hit.
++ *
++ * Inside an object group the innermost instance id is a member index, not an
++ * object index, so it is resolved through the group's member records. Doing it
++ * here rather than at each call site means every hit program - shadow, local,
++ * volume - resolves correctly without further changes. */
+ ccl_device_forceinline int get_object_id()
+ {
+-#ifdef __OBJECT_MOTION__
+-  /* Always get the instance ID from the TLAS
+-   * There might be a motion transform node between TLAS and BLAS which does not have one. */
+-  return optixGetInstanceIdFromHandle(optixGetTransformListHandle(0));
+-#else
+-  return optixGetInstanceId();
+-#endif
++  const unsigned int inner = (unsigned int)get_object_id_inner();
++  if ((inner & OBJECT_GROUP_MEMBER_FLAG) != 0) {
++    const int member = (int)(inner & ~OBJECT_GROUP_MEMBER_FLAG);
++    return kernel_data_fetch(group_members, member).object;
++  }
++  return (int)inner;
++}
++
++/* Which placement of a group this hit came through, or OBJECT_NONE when the hit
++ * was not inside a group. Needed to compose the world transform, since the
++ * object above carries only the member's group-local one. */
++ccl_device_forceinline int get_placement_id()
++{
++  return is_object_group_hit() ? get_object_id_outer() : OBJECT_NONE;
+ }
+ 
+ ccl_device_forceinline Intersection get_intersection()
+@@ -56,6 +130,7 @@ ccl_device_forceinline Intersection get_intersection()
+   isect.t = optixGetRayTmax();
+   isect.prim = optixGetPrimitiveIndex();
+   isect.object = get_object_id();
++  isect.instance = get_placement_id();
+ 
+   if (optixIsTriangleHit()) {
+     /* Triangle. */
+@@ -144,6 +219,7 @@ extern "C" __global__ void __anyhit__kernel_optix_local_hit()
+   isect->t = isect_t;
+   isect->prim = prim;
+   isect->object = get_object_id();
++  isect->instance = get_placement_id();
+   isect->type = kernel_data_fetch(objects, isect->object).primitive_type;
+ 
+   const float2 barycentrics = optixGetTriangleBarycentrics();
+@@ -254,7 +330,7 @@ extern "C" __global__ void __anyhit__kernel_optix_visibility_test()
+     }
+ #endif
+ 
+-    if (intersection_skip_self_shadow(ray->self, object, prim)) {
++    if (intersection_skip_self_shadow(ray->self, object, prim, get_placement_id())) {
+       return optixIgnoreIntersection();
+     }
+     else {
+@@ -263,7 +339,7 @@ extern "C" __global__ void __anyhit__kernel_optix_visibility_test()
+     }
+   }
+   else {
+-    if (intersection_skip_self(ray->self, object, prim)) {
++    if (intersection_skip_self(ray->self, object, prim, get_placement_id())) {
+       return optixIgnoreIntersection();
+     }
+   }
+@@ -276,6 +352,7 @@ extern "C" __global__ void __closesthit__kernel_optix_hit()
+ 
+   optixSetPayload_0(__float_as_uint(optixGetRayTmax())); /* Intersection distance */
+   optixSetPayload_4(object);
++  optixSetPayload_8(get_placement_id());
+ 
+   if (optixIsTriangleHit()) {
+     const float2 barycentrics = optixGetTriangleBarycentrics();
+@@ -401,6 +478,9 @@ ccl_device_intersect bool scene_intersect(KernelGlobals kg,
+   uint p5 = PRIMITIVE_NONE;
+   uint p6 = pointer_pack_to_uint_0(ray);
+   uint p7 = pointer_pack_to_uint_1(ray);
++  /* Object group placement, or OBJECT_NONE. Carried in its own register because
++   * the two instancing ids do not fit in one 32-bit value at these scales. */
++  uint p8 = OBJECT_NONE;
+ 
+   uint ray_mask = visibility & 0xFF;
+   uint ray_flags = OPTIX_RAY_FLAG_ENFORCE_ANYHIT;
+@@ -429,13 +509,15 @@ ccl_device_intersect bool scene_intersect(KernelGlobals kg,
+              p4,
+              p5,
+              p6,
+-             p7);
++             p7,
++             p8);
+ 
+   isect->t = __uint_as_float(p0);
+   isect->u = __uint_as_float(p1);
+   isect->v = __uint_as_float(p2);
+   isect->prim = p3;
+   isect->object = p4;
++  isect->instance = (int)p8;
+   isect->type = p5;
+ 
+   return p5 != PRIMITIVE_NONE;
+@@ -456,6 +538,12 @@ ccl_device_intersect bool scene_intersect_shadow(KernelGlobals kg,
+   uint p5 = PRIMITIVE_NONE;
+   uint p6 = pointer_pack_to_uint_0(ray);
+   uint p7 = pointer_pack_to_uint_1(ray);
++  /* Unused here, but this trace reaches PG_HITD whose closest-hit program
++   * writes slot 8. Accessing a payload the trace never declared is undefined
++   * in OptiX and can corrupt neighbouring registers - slot 4 carries the
++   * visibility mask for this trace, so corrupting it breaks shadow rays on
++   * ordinary geometry, with or without object groups. */
++  uint p8 = OBJECT_NONE;
+ 
+   uint ray_mask = visibility & 0xFF;
+   uint ray_flags = OPTIX_RAY_FLAG_ENFORCE_ANYHIT;
+@@ -484,7 +572,8 @@ ccl_device_intersect bool scene_intersect_shadow(KernelGlobals kg,
+                 p4,
+                 p5,
+                 p6,
+-                p7);
++                p7,
++                p8);
+ 
+   return optixHitObjectIsHit();
+ }
+@@ -635,6 +724,7 @@ ccl_device_intersect bool scene_intersect_volume(KernelGlobals kg,
+   isect->v = __uint_as_float(p2);
+   isect->prim = p3;
+   isect->object = p4;
++  isect->instance = OBJECT_NONE;
+   isect->type = p5;
+ 
+   return p5 != PRIMITIVE_NONE;
+diff --git a/intern/cycles/kernel/geom/curve_intersect.h b/intern/cycles/kernel/geom/curve_intersect.h
+index 264be685fcb..a3da40548d4 100644
+--- a/intern/cycles/kernel/geom/curve_intersect.h
++++ b/intern/cycles/kernel/geom/curve_intersect.h
+@@ -834,6 +834,7 @@ ccl_device_forceinline bool curve_intersect(KernelGlobals kg,
+       if (ribbon_intersect(ray_P, ray_D, tmin, tmax, subdivisions, curve, isect)) {
+         isect->prim = prim;
+         isect->object = object;
++        isect->instance = OBJECT_NONE;
+         isect->type = type;
+         return true;
+       }
+@@ -843,6 +844,7 @@ ccl_device_forceinline bool curve_intersect(KernelGlobals kg,
+       if (curve_intersect_recursive(ray_P, ray_D, tmin, tmax, curve, isect)) {
+         isect->prim = prim;
+         isect->object = object;
++        isect->instance = OBJECT_NONE;
+         isect->type = type;
+         return true;
+       }
+@@ -852,6 +854,7 @@ ccl_device_forceinline bool curve_intersect(KernelGlobals kg,
+       if (linear_curve_intersect(ray_P, ray_D, tmin, tmax, curve, isect)) {
+         isect->prim = prim;
+         isect->object = object;
++        isect->instance = OBJECT_NONE;
+         isect->type = type;
+         return true;
+       }
+diff --git a/intern/cycles/kernel/geom/motion_triangle_intersect.h b/intern/cycles/kernel/geom/motion_triangle_intersect.h
+index 0b11a09b96c..18d67390769 100644
+--- a/intern/cycles/kernel/geom/motion_triangle_intersect.h
++++ b/intern/cycles/kernel/geom/motion_triangle_intersect.h
+@@ -62,6 +62,7 @@ ccl_device_inline bool motion_triangle_intersect(KernelGlobals kg,
+       isect->v = v;
+       isect->prim = prim;
+       isect->object = object;
++      isect->instance = OBJECT_NONE;
+       isect->type = PRIMITIVE_MOTION_TRIANGLE;
+       return true;
+     }
+@@ -115,6 +116,7 @@ ccl_device_inline bool motion_triangle_intersect_local(KernelGlobals kg,
+   isect->v = v;
+   isect->prim = prim;
+   isect->object = object;
++  isect->instance = OBJECT_NONE;
+   isect->type = PRIMITIVE_MOTION_TRIANGLE;
+ 
+   /* Record geometric normal. */
+diff --git a/intern/cycles/kernel/geom/object.h b/intern/cycles/kernel/geom/object.h
+index 72c4fb6255a..db368a5bf77 100644
+--- a/intern/cycles/kernel/geom/object.h
++++ b/intern/cycles/kernel/geom/object.h
+@@ -17,6 +17,8 @@
+ #include "kernel/globals.h"
+ #include "kernel/types.h"
+ 
++#include "util/hash.h"
++
+ CCL_NAMESPACE_BEGIN
+ 
+ /* Object attributes, for now a fixed size and contents */
+@@ -98,9 +100,27 @@ ccl_device_inline Transform object_fetch_transform_motion_test(KernelGlobals kg,
+ 
+ /* Get transform matrix for shading point. */
+ 
++/* World transform of a hit inside an object group.
++ *
++ * The prototype carries the member's group-local transform and the placement
++ * carries the group's world transform; neither is the answer on its own. The
++ * composition is what is never stored, since storing it per visible instance is
++ * the N * M cost object groups exist to remove. */
++ccl_device_inline Transform object_group_transform(KernelGlobals kg,
++                                                   const int object,
++                                                   const int instance)
++{
++  const Transform placement = kernel_data_fetch(group_placements, instance).tfm;
++  const Transform local = kernel_data_fetch(objects, object).tfm;
++  return placement * local;
++}
++
+ ccl_device_inline Transform object_get_transform(KernelGlobals kg,
+                                                  const ccl_private ShaderData *sd)
+ {
++  if (sd->instance != OBJECT_NONE) {
++    return object_group_transform(kg, sd->object, sd->instance);
++  }
+ #ifdef __OBJECT_MOTION__
+   return (sd->object_flag & SD_OBJECT_MOTION) ?
+              sd->ob_tfm_motion :
+@@ -113,6 +133,12 @@ ccl_device_inline Transform object_get_transform(KernelGlobals kg,
+ ccl_device_inline Transform object_get_inverse_transform(KernelGlobals kg,
+                                                          const ccl_private ShaderData *sd)
+ {
++  if (sd->instance != OBJECT_NONE) {
++    /* Compose then invert once, rather than multiplying two stored inverses.
++     * Fewer operations, and it sidesteps the operand-order trap: the inverse of
++     * a product reverses, but the inverse TRANSPOSE used for normals does not. */
++    return transform_inverse(object_group_transform(kg, sd->object, sd->instance));
++  }
+ #ifdef __OBJECT_MOTION__
+   return (sd->object_flag & SD_OBJECT_MOTION) ?
+              sd->ob_itfm_motion :
+@@ -142,7 +168,7 @@ ccl_device_inline void object_position_transform(KernelGlobals kg,
+   }
+ #endif
+ 
+-  const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_TRANSFORM);
++  const Transform tfm = object_get_transform(kg, sd);
+   *P = transform_point(&tfm, *P);
+ }
+ 
+@@ -160,7 +186,7 @@ ccl_device_inline void object_inverse_position_transform(KernelGlobals kg,
+   }
+ #endif
+ 
+-  const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_INVERSE_TRANSFORM);
++  const Transform tfm = object_get_inverse_transform(kg, sd);
+   *P = transform_point(&tfm, *P);
+ }
+ 
+@@ -191,7 +217,7 @@ ccl_device_inline void object_inverse_normal_transform(KernelGlobals kg,
+ #endif
+ 
+   if (sd->object != OBJECT_NONE) {
+-    const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_TRANSFORM);
++    const Transform tfm = object_get_transform(kg, sd);
+     *N = safe_normalize(transform_direction_transposed(&tfm, *N));
+   }
+ }
+@@ -210,7 +236,7 @@ ccl_device_inline void object_normal_transform(KernelGlobals kg,
+ #endif
+ 
+   if (sd->object != OBJECT_NONE) {
+-    const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_INVERSE_TRANSFORM);
++    const Transform tfm = object_get_inverse_transform(kg, sd);
+     *N = normalize(transform_direction_transposed(&tfm, *N));
+   }
+ }
+@@ -233,7 +259,7 @@ ccl_device_inline void object_dir_transform(KernelGlobals kg,
+   }
+ #endif
+ 
+-  const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_TRANSFORM);
++  const Transform tfm = object_get_transform(kg, sd);
+   *D = transform_direction(&tfm, *D);
+ }
+ 
+@@ -250,7 +276,7 @@ ccl_device_inline void object_inverse_dir_transform(KernelGlobals kg,
+   }
+ #endif
+ 
+-  const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_INVERSE_TRANSFORM);
++  const Transform tfm = object_get_inverse_transform(kg, sd);
+   *D = transform_direction(&tfm, *D);
+ }
+ 
+@@ -268,7 +294,7 @@ ccl_device_inline float3 object_location(KernelGlobals kg, const ccl_private Sha
+   }
+ #endif
+ 
+-  const Transform tfm = object_fetch_transform(kg, sd->object, OBJECT_TRANSFORM);
++  const Transform tfm = object_get_transform(kg, sd);
+   return make_float3(tfm.x.w, tfm.y.w, tfm.z.w);
+ }
+ 
+@@ -319,12 +345,26 @@ ccl_device_inline int object_lightgroup(KernelGlobals kg, const int object)
+ 
+ /* Per object random number for shader variation */
+ 
+-ccl_device_inline float object_random_number(KernelGlobals kg, const int object)
++ccl_device_inline float object_random_number(KernelGlobals kg,
++                                             const int object,
++                                             const int instance)
+ {
+   if (object == OBJECT_NONE) {
+     return 0.0f;
+   }
+ 
++  /* Inside a group, per-placement and per-member variation are composed rather
++   * than stored. The placement carries a seed and the prototype index
++   * identifies the member, so N * M distinct values cost N + M to store --
++   * which is the whole reason a forest fits in memory.
++   *
++   * Without this every placement of a group renders identically, which for
++   * scattered vegetation is the first thing anyone would notice. */
++  if (instance != OBJECT_NONE) {
++    const uint seed = kernel_data_fetch(group_placements, instance).random_id;
++    return (float)hash_uint2(seed, (uint)object) * (1.0f / (float)0xFFFFFFFF);
++  }
++
+   return kernel_data_fetch(objects, object).random_number;
+ }
+ 
+diff --git a/intern/cycles/kernel/geom/point_intersect.h b/intern/cycles/kernel/geom/point_intersect.h
+index 70ee99233c6..aa28f0d3eac 100644
+--- a/intern/cycles/kernel/geom/point_intersect.h
++++ b/intern/cycles/kernel/geom/point_intersect.h
+@@ -85,6 +85,7 @@ ccl_device_forceinline bool point_intersect(KernelGlobals kg,
+ 
+   isect->prim = prim;
+   isect->object = object;
++  isect->instance = OBJECT_NONE;
+   isect->type = type;
+   isect->u = 0.0f;
+   isect->v = 0.0f;
+diff --git a/intern/cycles/kernel/geom/shader_data.h b/intern/cycles/kernel/geom/shader_data.h
+index dbd789d0c07..a0cc30d8a00 100644
+--- a/intern/cycles/kernel/geom/shader_data.h
++++ b/intern/cycles/kernel/geom/shader_data.h
+@@ -59,6 +59,7 @@ ccl_device_inline
+   sd->ray_length = isect->t;
+   sd->type = isect->type;
+   sd->object = isect->object;
++  sd->instance = isect->instance;
+   sd->object_flag = kernel_data_fetch(object_flag, sd->object);
+   sd->prim = isect->prim;
+   sd->flag = 0;
+@@ -168,6 +169,7 @@ ccl_device_inline void shader_setup_from_sample(KernelGlobals kg,
+ 
+   /* primitive */
+   sd->object = object;
++  sd->instance = OBJECT_NONE;
+   /* Currently no access to bvh prim index for strand sd->prim. */
+   sd->prim = prim;
+   sd->u = u;
+@@ -325,6 +327,7 @@ ccl_device void shader_setup_from_curve(KernelGlobals kg,
+ 
+   /* Object */
+   sd->object = object;
++  sd->instance = OBJECT_NONE;
+   sd->object_flag = kernel_data_fetch(object_flag, sd->object);
+ #  ifdef __OBJECT_MOTION__
+   shader_setup_object_transforms(kg, sd, sd->time);
+@@ -406,6 +409,7 @@ ccl_device_inline void shader_setup_from_background(KernelGlobals kg,
+   sd->ray_length = FLT_MAX;
+ 
+   sd->object = OBJECT_NONE;
++  sd->instance = OBJECT_NONE;
+   sd->prim = PRIM_NONE;
+   sd->type = PRIMITIVE_NONE;
+   sd->u = 0.0f;
+@@ -448,6 +452,7 @@ ccl_device_inline void shader_setup_from_volume(ccl_private ShaderData *ccl_rest
+ 
+   /* TODO: fill relevant fields for texture coordinates. */
+   sd->object = object;
++  sd->instance = OBJECT_NONE;
+   sd->prim = PRIM_NONE;
+   sd->type = PRIMITIVE_VOLUME;
+ 
+diff --git a/intern/cycles/kernel/geom/triangle_intersect.h b/intern/cycles/kernel/geom/triangle_intersect.h
+index f35d9867593..9c13f1e30f1 100644
+--- a/intern/cycles/kernel/geom/triangle_intersect.h
++++ b/intern/cycles/kernel/geom/triangle_intersect.h
+@@ -50,6 +50,7 @@ ccl_device_inline bool triangle_intersect(KernelGlobals kg,
+ #endif
+     {
+       isect->object = object;
++      isect->instance = OBJECT_NONE;
+       isect->prim = prim;
+       isect->type = PRIMITIVE_TRIANGLE;
+       isect->u = u;
+@@ -106,6 +107,7 @@ ccl_device_inline bool triangle_intersect_local(KernelGlobals kg,
+   ccl_private Intersection *isect = &local_isect->hits[hit_index];
+   isect->prim = prim;
+   isect->object = object;
++  isect->instance = OBJECT_NONE;
+   isect->type = PRIMITIVE_TRIANGLE;
+   isect->u = u;
+   isect->v = v;
+diff --git a/intern/cycles/kernel/integrator/init_from_bake.h b/intern/cycles/kernel/integrator/init_from_bake.h
+index 4e19dc0f2fc..66e0c758721 100644
+--- a/intern/cycles/kernel/integrator/init_from_bake.h
++++ b/intern/cycles/kernel/integrator/init_from_bake.h
+@@ -309,6 +309,7 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
+     /* Setup and write intersection. */
+     Intersection isect ccl_optional_struct_init;
+     isect.object = kernel_data.bake.object_index;
++    isect.instance = OBJECT_NONE;
+     isect.prim = prim;
+     isect.u = u;
+     isect.v = v;
+diff --git a/intern/cycles/kernel/integrator/intersect_closest.h b/intern/cycles/kernel/integrator/intersect_closest.h
+index 25a59263d5a..a6c8563ba03 100644
+--- a/intern/cycles/kernel/integrator/intersect_closest.h
++++ b/intern/cycles/kernel/integrator/intersect_closest.h
+@@ -362,6 +362,7 @@ ccl_device void integrator_intersect_closest(KernelGlobals kg,
+   const uint visibility = path_state_ray_visibility(state);
+   const int last_isect_prim = INTEGRATOR_STATE(state, isect, prim);
+   const int last_isect_object = INTEGRATOR_STATE(state, isect, object);
++  const int last_isect_instance = INTEGRATOR_STATE(state, isect, instance);
+ 
+   /* Trick to use short AO rays to approximate indirect light at the end of the path. */
+   if (path_state_ao_bounce(kg, state)) {
+@@ -378,8 +379,10 @@ ccl_device void integrator_intersect_closest(KernelGlobals kg,
+   /* Scene Intersection. */
+   Intersection isect ccl_optional_struct_init;
+   isect.object = OBJECT_NONE;
++  isect.instance = OBJECT_NONE;
+   isect.prim = PRIM_NONE;
+   ray.self.object = last_isect_object;
++  ray.self.instance = last_isect_instance;
+   ray.self.prim = last_isect_prim;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/integrator/intersect_dedicated_light.h b/intern/cycles/kernel/integrator/intersect_dedicated_light.h
+index 0058ccffdf4..f50862d5b14 100644
+--- a/intern/cycles/kernel/integrator/intersect_dedicated_light.h
++++ b/intern/cycles/kernel/integrator/intersect_dedicated_light.h
+@@ -189,6 +189,7 @@ ccl_device bool shadow_linking_intersect(KernelGlobals kg, IntegratorState state
+ 
+   ray.self.prim = INTEGRATOR_STATE(state, isect, prim);
+   ray.self.object = INTEGRATOR_STATE(state, isect, object);
++  ray.self.instance = INTEGRATOR_STATE(state, isect, instance);
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+ 
+diff --git a/intern/cycles/kernel/integrator/intersect_volume_stack.h b/intern/cycles/kernel/integrator/intersect_volume_stack.h
+index 76725da9b01..5f52a42a626 100644
+--- a/intern/cycles/kernel/integrator/intersect_volume_stack.h
++++ b/intern/cycles/kernel/integrator/intersect_volume_stack.h
+@@ -31,6 +31,7 @@ ccl_device void integrator_volume_stack_update_for_subsurface(KernelGlobals kg,
+   volume_ray.D = safe_normalize_len(to_P - from_P, &volume_ray.tmax);
+   volume_ray.tmin = 0.0f;
+   volume_ray.self.object = INTEGRATOR_STATE(state, isect, object);
++  volume_ray.self.instance = INTEGRATOR_STATE(state, isect, instance);
+   volume_ray.self.prim = INTEGRATOR_STATE(state, isect, prim);
+   volume_ray.self.light_object = OBJECT_NONE;
+   volume_ray.self.light_prim = PRIM_NONE;
+@@ -73,6 +74,7 @@ ccl_device void integrator_volume_stack_update_for_subsurface(KernelGlobals kg,
+     /* Move ray forward. */
+     volume_ray.tmin = intersection_t_offset(isect.t);
+     volume_ray.self.object = isect.object;
++    volume_ray.self.instance = isect.instance;
+     volume_ray.self.prim = isect.prim;
+     ++step;
+   }
+@@ -95,6 +97,7 @@ ccl_device void integrator_volume_stack_init(KernelGlobals kg, IntegratorState s
+   volume_ray.tmin = 0.0f;
+   volume_ray.tmax = FLT_MAX;
+   volume_ray.self.object = OBJECT_NONE;
++  volume_ray.self.instance = OBJECT_NONE;
+   volume_ray.self.prim = PRIM_NONE;
+   volume_ray.self.light_object = OBJECT_NONE;
+   volume_ray.self.light_prim = PRIM_NONE;
+@@ -216,6 +219,7 @@ ccl_device void integrator_volume_stack_init(KernelGlobals kg, IntegratorState s
+     /* Move ray forward. */
+     volume_ray.tmin = intersection_t_offset(isect.t);
+     volume_ray.self.object = isect.object;
++    volume_ray.self.instance = isect.instance;
+     volume_ray.self.prim = isect.prim;
+     ++step;
+   }
+diff --git a/intern/cycles/kernel/integrator/mnee.h b/intern/cycles/kernel/integrator/mnee.h
+index a222e3dba9a..b699ff87741 100644
+--- a/intern/cycles/kernel/integrator/mnee.h
++++ b/intern/cycles/kernel/integrator/mnee.h
+@@ -475,12 +475,14 @@ ccl_device_inline bool mnee_newton_solver(KernelGlobals kg,
+        * valid to a valid path even if occluded. */
+       if (vi == 0) {
+         projection_ray.self.object = sd->object;
++        projection_ray.self.instance = sd->instance;
+         projection_ray.self.prim = sd->prim;
+         projection_ray.P = sd->P;
+       }
+       else {
+         const ccl_private ManifoldVertex &pv = vertices[vi - 1];
+         projection_ray.self.object = pv.object;
++        projection_ray.self.instance = OBJECT_NONE;
+         projection_ray.self.prim = pv.prim;
+         projection_ray.P = pv.p;
+       }
+@@ -501,6 +503,7 @@ ccl_device_inline bool mnee_newton_solver(KernelGlobals kg,
+         }
+ 
+         projection_ray.self.object = projection_isect.object;
++        projection_ray.self.instance = projection_isect.instance;
+         projection_ray.self.prim = projection_isect.prim;
+         projection_ray.tmin = intersection_t_offset(projection_isect.t);
+       }
+@@ -864,6 +867,7 @@ ccl_device_inline ShaderEvalResult mnee_path_contribution(KernelGlobals kg,
+   Intersection probe_isect;
+ 
+   probe_ray.self.object = sd->object;
++  probe_ray.self.instance = sd->instance;
+   probe_ray.self.prim = sd->prim;
+   probe_ray.P = sd->P;
+ 
+@@ -884,6 +888,7 @@ ccl_device_inline ShaderEvalResult mnee_path_contribution(KernelGlobals kg,
+       }
+     }
+     probe_ray.self.object = v.object;
++    probe_ray.self.instance = OBJECT_NONE;
+     probe_ray.self.prim = v.prim;
+     probe_ray.P = v.p;
+ 
+@@ -964,6 +969,7 @@ ccl_device_inline ShaderEvalResult kernel_path_mnee_sample(KernelGlobals kg,
+   /* Setup probe ray. */
+   Ray probe_ray;
+   probe_ray.self.object = sd->object;
++  probe_ray.self.instance = sd->instance;
+   probe_ray.self.prim = sd->prim;
+   probe_ray.self.light_object = ls->object;
+   probe_ray.self.light_prim = ls->prim;
+@@ -1061,6 +1067,7 @@ ccl_device_inline ShaderEvalResult kernel_path_mnee_sample(KernelGlobals kg,
+     }
+ 
+     probe_ray.self.object = probe_isect.object;
++    probe_ray.self.instance = probe_isect.instance;
+     probe_ray.self.prim = probe_isect.prim;
+     probe_ray.tmin = intersection_t_offset(probe_isect.t);
+   };
+diff --git a/intern/cycles/kernel/integrator/shade_dedicated_light.h b/intern/cycles/kernel/integrator/shade_dedicated_light.h
+index dc5241bd800..f3bcd0b6fdf 100644
+--- a/intern/cycles/kernel/integrator/shade_dedicated_light.h
++++ b/intern/cycles/kernel/integrator/shade_dedicated_light.h
+@@ -67,6 +67,7 @@ ccl_device void shadow_linking_setup_ray_from_intersection(
+    * Those are copied to the dedicated storage from the main intersection after the surface bounce,
+    * but before the main intersection is re-used to find light to trace a ray to. */
+   ray->self.object = INTEGRATOR_STATE(state, shadow_link, last_isect_object);
++  ray->self.instance = OBJECT_NONE;
+   ray->self.prim = INTEGRATOR_STATE(state, shadow_link, last_isect_prim);
+ 
+   ray->self.light_object = isect->object;
+diff --git a/intern/cycles/kernel/integrator/shade_light.h b/intern/cycles/kernel/integrator/shade_light.h
+index 13da8c09922..9e644560204 100644
+--- a/intern/cycles/kernel/integrator/shade_light.h
++++ b/intern/cycles/kernel/integrator/shade_light.h
+@@ -121,6 +121,7 @@ ccl_device ShaderEvalResult integrate_light_nee(KernelGlobals kg, IntegratorShad
+ 
+   Intersection isect = {};
+   isect.object = ray.self.light_object;
++  isect.instance = OBJECT_NONE;
+   isect.prim = ray.self.light_prim;
+   isect.type = kernel_data_fetch(objects, isect.object).primitive_type;
+   isect.t = ray.tmax;
+diff --git a/intern/cycles/kernel/integrator/shade_shadow.h b/intern/cycles/kernel/integrator/shade_shadow.h
+index 23c77ce65a9..a97815cade7 100644
+--- a/intern/cycles/kernel/integrator/shade_shadow.h
++++ b/intern/cycles/kernel/integrator/shade_shadow.h
+@@ -157,6 +157,7 @@ ccl_device_inline bool integrate_transparent_volume_shadow(KernelGlobals kg,
+   Ray ray ccl_optional_struct_init;
+   integrator_state_read_shadow_ray(state, &ray);
+   ray.self.object = OBJECT_NONE;
++  ray.self.instance = OBJECT_NONE;
+   ray.self.prim = PRIM_NONE;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index 477dfb6f873..d880127340b 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -707,6 +707,7 @@ ccl_device_forceinline void integrate_surface_ao(KernelGlobals kg,
+   ray.tmax = kernel_data.integrator.ao_bounces_distance;
+   ray.time = sd->time;
+   ray.self.object = (skip_self) ? sd->object : OBJECT_NONE;
++  ray.self.instance = (skip_self) ? sd->instance : OBJECT_NONE;
+   ray.self.prim = (skip_self) ? sd->prim : PRIM_NONE;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/integrator/shadow_state_template.h b/intern/cycles/kernel/integrator/shadow_state_template.h
+index d8c6e1287b2..02e5d6ad36c 100644
+--- a/intern/cycles/kernel/integrator/shadow_state_template.h
++++ b/intern/cycles/kernel/integrator/shadow_state_template.h
+@@ -97,6 +97,7 @@ KERNEL_STRUCT_ARRAY_MEMBER(shadow_isect, float, u, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_ARRAY_MEMBER(shadow_isect, float, v, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_ARRAY_MEMBER(shadow_isect, int, prim, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_ARRAY_MEMBER(shadow_isect, int, object, KERNEL_FEATURE_PATH_TRACING)
++KERNEL_STRUCT_ARRAY_MEMBER(shadow_isect, int, instance, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_ARRAY_MEMBER(shadow_isect, int, type, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_END_ARRAY(shadow_isect,
+                         INTEGRATOR_SHADOW_ISECT_SIZE_CPU,
+diff --git a/intern/cycles/kernel/integrator/state_template.h b/intern/cycles/kernel/integrator/state_template.h
+index 1fbcb741770..2998baef055 100644
+--- a/intern/cycles/kernel/integrator/state_template.h
++++ b/intern/cycles/kernel/integrator/state_template.h
+@@ -95,6 +95,7 @@ KERNEL_STRUCT_MEMBER_PACKED(isect, float, u, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_MEMBER_PACKED(isect, float, v, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_MEMBER_PACKED(isect, int, prim, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_MEMBER_PACKED(isect, int, object, KERNEL_FEATURE_PATH_TRACING)
++KERNEL_STRUCT_MEMBER_PACKED(isect, int, instance, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_MEMBER_PACKED(isect, int, type, KERNEL_FEATURE_PATH_TRACING)
+ KERNEL_STRUCT_END(isect)
+ 
+diff --git a/intern/cycles/kernel/integrator/state_util.h b/intern/cycles/kernel/integrator/state_util.h
+index 5830104014e..06caf7ccadd 100644
+--- a/intern/cycles/kernel/integrator/state_util.h
++++ b/intern/cycles/kernel/integrator/state_util.h
+@@ -137,6 +137,11 @@ ccl_device_forceinline void integrator_state_write_shadow_ray_self(
+       state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, object) = ray->self.object;
+   INTEGRATOR_STATE_ARRAY_WRITE(
+       state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, prim) = ray->self.prim;
++  /* The instance completes the identity: under nested instancing one object and
++   * prim describe every placement of a prototype, so storing only those two
++   * cannot say which one this ray started from. */
++  INTEGRATOR_STATE_ARRAY_WRITE(
++      state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, instance) = ray->self.instance;
+ 
+   INTEGRATOR_STATE_WRITE(state, shadow_ray, self_light_object) = ray->self.light_object;
+   INTEGRATOR_STATE_WRITE(state, shadow_ray, self_light_prim) = ray->self.light_prim;
+@@ -149,6 +154,8 @@ ccl_device_forceinline void integrator_state_read_shadow_ray_self(
+       state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, object);
+   ray->self.prim = INTEGRATOR_STATE_ARRAY(
+       state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, prim);
++  ray->self.instance = INTEGRATOR_STATE_ARRAY(
++      state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, instance);
+   ray->self.light_object = INTEGRATOR_STATE(state, shadow_ray, self_light_object);
+   ray->self.light_prim = INTEGRATOR_STATE(state, shadow_ray, self_light_prim);
+ }
+@@ -171,6 +178,8 @@ ccl_device_forceinline void integrator_state_write_isect(
+                 "Generated packed_isect struct is misaligned with Intersection struct");
+   static_assert(offsetof(packed_isect, object) == offsetof(Intersection, object),
+                 "Generated packed_isect struct is misaligned with Intersection struct");
++  static_assert(offsetof(packed_isect, instance) == offsetof(Intersection, instance),
++                "Generated packed_isect struct is misaligned with Intersection struct");
+   static_assert(offsetof(packed_isect, prim) == offsetof(Intersection, prim),
+                 "Generated packed_isect struct is misaligned with Intersection struct");
+   static_assert(offsetof(packed_isect, type) == offsetof(Intersection, type),
+@@ -180,6 +189,7 @@ ccl_device_forceinline void integrator_state_write_isect(
+   INTEGRATOR_STATE_WRITE(state, isect, u) = isect->u;
+   INTEGRATOR_STATE_WRITE(state, isect, v) = isect->v;
+   INTEGRATOR_STATE_WRITE(state, isect, object) = isect->object;
++  INTEGRATOR_STATE_WRITE(state, isect, instance) = isect->instance;
+   INTEGRATOR_STATE_WRITE(state, isect, prim) = isect->prim;
+   INTEGRATOR_STATE_WRITE(state, isect, type) = isect->type;
+ #endif
+@@ -193,6 +203,7 @@ ccl_device_forceinline void integrator_state_read_isect(
+ #else
+   isect->prim = INTEGRATOR_STATE(state, isect, prim);
+   isect->object = INTEGRATOR_STATE(state, isect, object);
++  isect->instance = INTEGRATOR_STATE(state, isect, instance);
+   isect->type = INTEGRATOR_STATE(state, isect, type);
+   isect->u = INTEGRATOR_STATE(state, isect, u);
+   isect->v = INTEGRATOR_STATE(state, isect, v);
+@@ -299,6 +310,7 @@ ccl_device_forceinline void integrator_state_write_shadow_isect(
+   INTEGRATOR_STATE_ARRAY_WRITE(state, shadow_isect, index, u) = isect->u;
+   INTEGRATOR_STATE_ARRAY_WRITE(state, shadow_isect, index, v) = isect->v;
+   INTEGRATOR_STATE_ARRAY_WRITE(state, shadow_isect, index, object) = isect->object;
++  INTEGRATOR_STATE_ARRAY_WRITE(state, shadow_isect, index, instance) = isect->instance;
+   INTEGRATOR_STATE_ARRAY_WRITE(state, shadow_isect, index, prim) = isect->prim;
+   INTEGRATOR_STATE_ARRAY_WRITE(state, shadow_isect, index, type) = isect->type;
+ }
+@@ -310,6 +322,7 @@ ccl_device_forceinline void integrator_state_read_shadow_isect(
+ {
+   isect->prim = INTEGRATOR_STATE_ARRAY(state, shadow_isect, index, prim);
+   isect->object = INTEGRATOR_STATE_ARRAY(state, shadow_isect, index, object);
++  isect->instance = INTEGRATOR_STATE_ARRAY(state, shadow_isect, index, instance);
+   isect->type = INTEGRATOR_STATE_ARRAY(state, shadow_isect, index, type);
+   isect->u = INTEGRATOR_STATE_ARRAY(state, shadow_isect, index, u);
+   isect->v = INTEGRATOR_STATE_ARRAY(state, shadow_isect, index, v);
+@@ -449,6 +462,7 @@ ccl_device_forceinline void integrator_state_read_mnee_ray(ConstIntegratorState
+   ray->dP = INTEGRATOR_STATE(shadow_state, shadow_ray, dP);
+   ray->dD = INTEGRATOR_STATE(shadow_state, shadow_ray, dD);
+   ray->self.object = INTEGRATOR_STATE_ARRAY(shadow_state, shadow_isect, 1, object);
++  ray->self.instance = INTEGRATOR_STATE_ARRAY(shadow_state, shadow_isect, 1, instance);
+   ray->self.prim = INTEGRATOR_STATE_ARRAY(shadow_state, shadow_isect, 1, type);
+   ray->self.light_object = ls->object;
+   ray->self.light_prim = ls->prim;
+diff --git a/intern/cycles/kernel/integrator/subsurface_disk.h b/intern/cycles/kernel/integrator/subsurface_disk.h
+index c2073ed5c04..936e639dda7 100644
+--- a/intern/cycles/kernel/integrator/subsurface_disk.h
++++ b/intern/cycles/kernel/integrator/subsurface_disk.h
+@@ -108,6 +108,7 @@ ccl_device_inline bool subsurface_disk(KernelGlobals kg,
+   ray.dD = differential_zero_compact();
+   ray.time = time;
+   ray.self.object = OBJECT_NONE;
++  ray.self.instance = OBJECT_NONE;
+   ray.self.prim = PRIM_NONE;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/integrator/subsurface_random_walk.h b/intern/cycles/kernel/integrator/subsurface_random_walk.h
+index 8d05f4bab3e..3689b88be71 100644
+--- a/intern/cycles/kernel/integrator/subsurface_random_walk.h
++++ b/intern/cycles/kernel/integrator/subsurface_random_walk.h
+@@ -211,6 +211,7 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+   const float time = INTEGRATOR_STATE(state, ray, time);
+   const float3 N = INTEGRATOR_STATE(state, subsurface, N);
+   const int object = INTEGRATOR_STATE(state, isect, object);
++  const int instance = INTEGRATOR_STATE(state, isect, instance);
+   const int prim = INTEGRATOR_STATE(state, isect, prim);
+ 
+   /* Setup ray. */
+@@ -222,6 +223,7 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+   ray.dP = ray_dP;
+   ray.dD = differential_zero_compact();
+   ray.self.object = object;
++  ray.self.instance = instance;
+   ray.self.prim = prim;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+@@ -411,6 +413,7 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+       ray.tmax = t;
+       /* After the first bounce the object can intersect the same surface again */
+       ray.self.object = OBJECT_NONE;
++      ray.self.instance = OBJECT_NONE;
+       ray.self.prim = PRIM_NONE;
+     }
+     scene_intersect_local<true>(kg, &ray, &ss_isect, object, nullptr, 1);
+diff --git a/intern/cycles/kernel/light/sample.h b/intern/cycles/kernel/light/sample.h
+index 12e978aa423..86d155a7e35 100644
+--- a/intern/cycles/kernel/light/sample.h
++++ b/intern/cycles/kernel/light/sample.h
+@@ -295,6 +295,7 @@ ccl_device_inline void shadow_ray_setup(const ccl_private ShaderData *ccl_restri
+ 
+   /* Fill in intersection surface and light details. */
+   ray->self.object = (skip_self) ? sd->object : OBJECT_NONE;
++  ray->self.instance = (skip_self) ? sd->instance : OBJECT_NONE;
+   ray->self.prim = (skip_self) ? sd->prim : PRIM_NONE;
+   ray->self.light_object = ls->object;
+   ray->self.light_prim = ls->prim;
+diff --git a/intern/cycles/kernel/osl/services.cpp b/intern/cycles/kernel/osl/services.cpp
+index 306caedc6b8..d42bce78cb2 100644
+--- a/intern/cycles/kernel/osl/services.cpp
++++ b/intern/cycles/kernel/osl/services.cpp
+@@ -524,6 +524,7 @@ bool OSLRenderServices::trace(TraceOpt &options,
+   ray.tmax = (options.maxdist == 1.0e30f) ? FLT_MAX : options.maxdist;
+   ray.time = sd->time;
+   ray.self.object = OBJECT_NONE;
++  ray.self.instance = OBJECT_NONE;
+   ray.self.prim = PRIM_NONE;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+@@ -532,6 +533,7 @@ bool OSLRenderServices::trace(TraceOpt &options,
+     /* avoid self-intersections */
+     if (ray.P == sd->P) {
+       ray.self.object = sd->object;
++      ray.self.instance = sd->instance;
+       ray.self.prim = sd->prim;
+     }
+   }
+diff --git a/intern/cycles/kernel/osl/services_shared.h b/intern/cycles/kernel/osl/services_shared.h
+index 4e83f4df8b7..040b82b95b7 100644
+--- a/intern/cycles/kernel/osl/services_shared.h
++++ b/intern/cycles/kernel/osl/services_shared.h
+@@ -1068,7 +1068,7 @@ ccl_device_inline bool osl_shared_get_object_standard_attribute(KernelGlobals kg
+     return set_attribute(f, type, derivatives, val);
+   }
+   if (name == DeviceStrings::u_object_random) {
+-    const float f = object_random_number(kg, sd->object);
++    const float f = object_random_number(kg, sd->object, sd->instance);
+     return set_attribute(f, type, derivatives, val);
+   }
+ 
+diff --git a/intern/cycles/kernel/svm/ao.h b/intern/cycles/kernel/svm/ao.h
+index e252e837522..71b62ddffd7 100644
+--- a/intern/cycles/kernel/svm/ao.h
++++ b/intern/cycles/kernel/svm/ao.h
+@@ -74,6 +74,7 @@ ccl_device float svm_ao(
+     ray.tmax = max_dist;
+     ray.time = sd->time;
+     ray.self.object = sd->object;
++    ray.self.instance = sd->instance;
+     ray.self.prim = sd->prim;
+     ray.self.light_object = OBJECT_NONE;
+     ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/svm/bevel.h b/intern/cycles/kernel/svm/bevel.h
+index 28a85a58365..d3119eac151 100644
+--- a/intern/cycles/kernel/svm/bevel.h
++++ b/intern/cycles/kernel/svm/bevel.h
+@@ -199,6 +199,7 @@ ccl_device float3 svm_bevel(
+     ray.dD = differential_zero_compact();
+     ray.time = sd->time;
+     ray.self.object = OBJECT_NONE;
++    ray.self.instance = OBJECT_NONE;
+     ray.self.prim = PRIM_NONE;
+     ray.self.light_object = OBJECT_NONE;
+     ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/svm/geometry.h b/intern/cycles/kernel/svm/geometry.h
+index eebe39dd131..288dd5b1043 100644
+--- a/intern/cycles/kernel/svm/geometry.h
++++ b/intern/cycles/kernel/svm/geometry.h
+@@ -113,7 +113,7 @@ ccl_device_noinline void svm_node_object_info(KernelGlobals kg,
+       data = shader_pass_id(kg, sd);
+       break;
+     case NODE_INFO_OB_RANDOM: {
+-      data = object_random_number(kg, sd->object);
++      data = object_random_number(kg, sd->object, sd->instance);
+       break;
+     }
+     default:
+diff --git a/intern/cycles/kernel/svm/raycast.h b/intern/cycles/kernel/svm/raycast.h
+index 71718a34987..18abeff7cc9 100644
+--- a/intern/cycles/kernel/svm/raycast.h
++++ b/intern/cycles/kernel/svm/raycast.h
+@@ -60,6 +60,7 @@ ccl_device bool svm_raycast(KernelGlobals kg,
+   ray.tmax = distance;
+   ray.time = sd->time;
+   ray.self.object = avoid_self_intersection ? sd->object : OBJECT_NONE;
++  ray.self.instance = avoid_self_intersection ? sd->instance : OBJECT_NONE;
+   ray.self.prim = avoid_self_intersection ? sd->prim : PRIM_NONE;
+   ray.self.light_object = OBJECT_NONE;
+   ray.self.light_prim = PRIM_NONE;
+diff --git a/intern/cycles/kernel/types.h b/intern/cycles/kernel/types.h
+index de78d9541ea..2be1c689f6d 100644
+--- a/intern/cycles/kernel/types.h
++++ b/intern/cycles/kernel/types.h
+@@ -590,6 +590,13 @@ struct differential {
+ struct RaySelfPrimitives {
+   int prim;         /* Primitive the ray is starting from */
+   int object;       /* Instance prim is a part of */
++  /* Object group placement the ray is starting from, or OBJECT_NONE.
++   *
++   * Without this, two placements of the same group share a prototype index, so
++   * a ray leaving a leaf on one tree would skip the same primitive on a
++   * different tree - a light leak through geometry that is not the geometry the
++   * ray came from. */
++  int instance;
+   int light_prim;   /* Light primitive */
+   int light_object; /* Light object */
+ };
+@@ -614,7 +621,18 @@ struct Ray {
+ struct Intersection {
+   float t, u, v;
+   int prim;
++  /* Innermost instance: identifies the prototype that was hit. Indexes the
++   * per-object arrays. */
+   int object;
++  /* Which placement of an object group was hit, or OBJECT_NONE when the hit
++   * was not inside a group.
++   *
++   * A group hit resolves through two records: `object` gives the member's
++   * prototype, this gives the placement. The world transform is composed from
++   * both, which is why neither alone is enough. The pair cannot be packed into
++   * one int at the scales this targets - 100k placements needs 17 bits and
++   * 150k members needs 18. */
++  int instance;
+   int type;
+ };
+ 
+@@ -1050,6 +1068,11 @@ struct ccl_align(16) ShaderData {
+   /* object id if there is one, ~0 otherwise */
+   int object;
+ 
++  /* Object group placement this hit came through, or OBJECT_NONE when the hit
++   * was not inside a group. The world transform is composed from this and the
++   * prototype's group-local transform. */
++  int instance;
++
+   /* motion blur sample time */
+   float time;
+ 
+@@ -1308,6 +1331,16 @@ enum KernelBVHLayout {
+   BVH_LAYOUT_MULTI_EMBREEGPU = (1 << 12),
+   BVH_LAYOUT_MULTI_EMBREEGPU_EMBREE = (1 << 13),
+ 
++  /* Two-level instancing on OptiX: an intermediate IAS per object group,
++   * referenced by the top-level AS. See scene/objectgroup.h.
++   *
++   * Deliberately absent from BVH_LAYOUT_ALL below. That value is the seed
++   * MultiDevice ANDs across its sub-devices, so leaving this bit out means any
++   * multi-device configuration clears it and degrades to the flat layout with
++   * no extra code. Single-GPU OptiX gets nesting; everything else is
++   * unchanged. */
++  BVH_LAYOUT_OPTIX_NESTED = (1 << 14),
++
+   /* Default BVH layout to use for CPU. */
+   BVH_LAYOUT_AUTO = BVH_LAYOUT_EMBREE,
+   BVH_LAYOUT_ALL = BVH_LAYOUT_BVH2 | BVH_LAYOUT_EMBREE | BVH_LAYOUT_OPTIX | BVH_LAYOUT_METAL |
+@@ -1459,6 +1492,53 @@ struct KernelObject {
+ };
+ static_assert_align(KernelObject, 16);
+ 
++/* Object groups: a prototype instanced many times. See scene/objectgroup.h.
++ *
++ * These replace the N * M KernelObject records a flattened scene needs with
++ * M members plus N placements. At 1000 trees of 100k leaves that is 100M
++ * records against 101k.
++ *
++ * A hit inside a group yields two ids: the innermost identifies the member,
++ * the outermost identifies the placement. Prototype data comes from the
++ * member, per-instance data from the placement, and the world transform is
++ * composed from both. */
++
++/* Marks an OptiX instance id as an object group member rather than a plain
++ * object.
++ *
++ * The alternative - counting instancing levels in the transform list at each
++ * hit - is inference, and it has to agree across every hit program and
++ * traversal path or the same surface resolves two different ways depending on
++ * which ray struck it. That shows up as structured, blocky shading, not as
++ * anything that looks like a transform bug.
++ *
++ * Member indices are bounded by the members in one group, far below this bit,
++ * and OptiX instance ids are at least 28 bits. */
++#define OBJECT_GROUP_MEMBER_FLAG (1u << 26)
++
++struct KernelGroupMember {
++  /* Transform relative to the group origin. The world transform does not exist
++   * as stored data - storing it is what costs N * M. */
++  Transform local;
++  /* Prototype object holding geometry offsets, shader and attribute map.
++   * OBJECT_NONE when the member is not drawable. */
++  int object;
++  int pad1, pad2, pad3;
++};
++static_assert_align(KernelGroupMember, 16);
++
++struct KernelGroupPlacement {
++  /* World transform of the group origin. */
++  Transform tfm;
++  /* Seed for per-instance variation. Combined with the member index at shade
++   * time, so per-member randomness costs nothing to store. */
++  uint random_id;
++  uint visibility;
++  int group;
++  int pad1;
++};
++static_assert_align(KernelGroupPlacement, 16);
++
+ struct KernelCurve {
+   int shader_id;
+   int first_key;
+diff --git a/intern/cycles/scene/devicescene.cpp b/intern/cycles/scene/devicescene.cpp
+index dc8479bdcd5..038e28d6778 100644
+--- a/intern/cycles/scene/devicescene.cpp
++++ b/intern/cycles/scene/devicescene.cpp
+@@ -29,6 +29,8 @@ DeviceScene::DeviceScene(Device *device)
+       object_motion_pass(device, "object_motion_pass", MEM_GLOBAL),
+       object_motion(device, "object_motion", MEM_GLOBAL),
+       object_flag(device, "object_flag", MEM_GLOBAL),
++      group_members(device, "group_members", MEM_GLOBAL),
++      group_placements(device, "group_placements", MEM_GLOBAL),
+       object_prim_offset(device, "object_prim_offset", MEM_GLOBAL),
+       camera_motion(device, "camera_motion", MEM_GLOBAL),
+       attributes_map(device, "attributes_map", MEM_GLOBAL),
+diff --git a/intern/cycles/scene/devicescene.h b/intern/cycles/scene/devicescene.h
+index cee8bc85ce6..b3afb9ae653 100644
+--- a/intern/cycles/scene/devicescene.h
++++ b/intern/cycles/scene/devicescene.h
+@@ -43,6 +43,10 @@ class DeviceScene {
+   device_vector<Transform> object_motion_pass;
+   device_vector<DecomposedTransform> object_motion;
+   device_vector<uint> object_flag;
++
++  /* object groups */
++  device_vector<KernelGroupMember> group_members;
++  device_vector<KernelGroupPlacement> group_placements;
+   device_vector<uint> object_prim_offset;
+ 
+   /* cameras */
+diff --git a/intern/cycles/scene/geometry.cpp b/intern/cycles/scene/geometry.cpp
+index 1fe20811ee4..bfb9e32b59f 100644
+--- a/intern/cycles/scene/geometry.cpp
++++ b/intern/cycles/scene/geometry.cpp
+@@ -163,7 +163,8 @@ int Geometry::motion_step(const float time) const
+ 
+ bool Geometry::need_build_bvh(BVHLayout layout) const
+ {
+-  return is_instanced() || layout == BVH_LAYOUT_OPTIX || layout == BVH_LAYOUT_MULTI_OPTIX ||
++  return is_instanced() || layout == BVH_LAYOUT_OPTIX || layout == BVH_LAYOUT_OPTIX_NESTED ||
++         layout == BVH_LAYOUT_MULTI_OPTIX ||
+          layout == BVH_LAYOUT_METAL || layout == BVH_LAYOUT_MULTI_OPTIX_EMBREE ||
+          layout == BVH_LAYOUT_MULTI_METAL || layout == BVH_LAYOUT_MULTI_METAL_EMBREE ||
+          layout == BVH_LAYOUT_HIPRT || layout == BVH_LAYOUT_MULTI_HIPRT ||
+@@ -414,6 +415,7 @@ void GeometryManager::geom_calc_offset(Scene *scene, BVHLayout bvh_layout)
+       /* Need to rebuild BVH in OptiX, since refit only allows modified mesh data.
+        * Metal has optimization for static BVH, that also require a rebuild. */
+       const bool need_update_rebuild = (bvh_layout == BVH_LAYOUT_OPTIX ||
++                                        bvh_layout == BVH_LAYOUT_OPTIX_NESTED ||
+                                         bvh_layout == BVH_LAYOUT_MULTI_OPTIX ||
+                                         bvh_layout == BVH_LAYOUT_MULTI_OPTIX_EMBREE) ||
+                                        ((bvh_layout == BVH_LAYOUT_METAL ||
+diff --git a/intern/cycles/scene/geometry_bvh.cpp b/intern/cycles/scene/geometry_bvh.cpp
+index 700c12f1228..a8e9d782a3d 100644
+--- a/intern/cycles/scene/geometry_bvh.cpp
++++ b/intern/cycles/scene/geometry_bvh.cpp
+@@ -117,6 +117,7 @@ void GeometryManager::device_update_bvh(Device *device,
+ 
+   const bool can_refit = scene->bvh != nullptr && scene->params.bvh_type == BVH_TYPE_DYNAMIC &&
+                          (bparams.bvh_layout == BVHLayout::BVH_LAYOUT_OPTIX ||
++                          bparams.bvh_layout == BVHLayout::BVH_LAYOUT_OPTIX_NESTED ||
+                           bparams.bvh_layout == BVHLayout::BVH_LAYOUT_METAL);
+ 
+   BVH *bvh = scene->bvh.get();
+@@ -125,8 +126,16 @@ void GeometryManager::device_update_bvh(Device *device,
+     bvh = scene->bvh.get();
+   }
+ 
++  /* Lend the groups to the builder for this call. The scene owns them and
++   * rebuilds them each sync, so they must not outlive the build. */
++  bvh->object_groups = &scene->object_groups;
++  bvh->object_group_instances = &scene->object_group_instances;
++
+   device->build_bvh(bvh, progress, can_refit);
+ 
++  bvh->object_groups = nullptr;
++  bvh->object_group_instances = nullptr;
++
+   if (progress.get_cancel()) {
+     return;
+   }
+diff --git a/intern/cycles/scene/object.cpp b/intern/cycles/scene/object.cpp
+index 99c212d4a11..b7524b54a04 100644
+--- a/intern/cycles/scene/object.cpp
++++ b/intern/cycles/scene/object.cpp
+@@ -24,6 +24,7 @@
+ #include "util/map.h"
+ #include "util/murmurhash.h"
+ #include "util/progress.h"
++#include "util/update_timing.h"
+ #include "util/set.h"
+ #include "util/tbb.h"
+ #include "util/vector.h"
+@@ -284,6 +285,12 @@ int Object::motion_step(const float time) const
+ 
+ bool Object::is_traceable() const
+ {
++  /* Group prototypes are reached through their group's acceleration structure,
++   * never directly from the top level. Tracing one here would draw the
++   * prototype at the origin. */
++  if (is_group_prototype) {
++    return false;
++  }
+   /* Not supported for lights yet. */
+   if (geometry->is_light()) {
+     return false;
+@@ -842,19 +849,38 @@ void ObjectManager::device_update_transforms(DeviceScene *dscene, Scene *scene,
+   /* Parallel object update, with grain size to avoid too much threading overhead
+    * for individual objects. */
+   static const int OBJECTS_PER_TASK = 32;
+-  parallel_for(blocked_range<size_t>(0, scene->objects.size(), OBJECTS_PER_TASK),
+-               [&](const blocked_range<size_t> &r) {
+-                 for (size_t i = r.begin(); i != r.end(); i++) {
+-                   Object *ob = state.scene->objects[i];
+-                   device_update_object_transform(&state, ob, update_all, scene);
+-                 }
+-               });
++  {
++    /* Phase 1 instrumentation: this rebuilds every KernelObject in the scene,
++     * regardless of how many actually changed. */
++    update_timing_log("      objects=%zu  KernelObject=%zu B  total=%.1f MB  update_all=%d",
++                      scene->objects.size(),
++                      sizeof(KernelObject),
++                      double(scene->objects.size() * sizeof(KernelObject)) / (1024.0 * 1024.0),
++                      int(update_all));
++    const UpdateScopedTimer t("      device_update_transforms: rebuild all");
++    parallel_for(blocked_range<size_t>(0, scene->objects.size(), OBJECTS_PER_TASK),
++                 [&](const blocked_range<size_t> &r) {
++                   for (size_t i = r.begin(); i != r.end(); i++) {
++                     Object *ob = state.scene->objects[i];
++                     device_update_object_transform(&state, ob, update_all, scene);
++                   }
++                 });
++  }
+ 
+   if (progress.get_cancel()) {
+     return;
+   }
+ 
+-  dscene->objects.copy_to_device_if_modified();
++  {
++    /* Phase 1 instrumentation: device_vector tracks dirtiness with a single
++     * bool, so any change re-uploads the whole array. */
++    const bool will_upload = dscene->objects.is_modified();
++    update_timing_log("      objects upload: modified=%d  size=%.1f MB",
++                      int(will_upload),
++                      double(dscene->objects.size() * sizeof(KernelObject)) / (1024.0 * 1024.0));
++    const UpdateScopedTimer t("      objects.copy_to_device_if_modified");
++    dscene->objects.copy_to_device_if_modified();
++  }
+   if (state.need_motion == Scene::MOTION_PASS ||
+       state.need_motion == Scene::MOTION_PASS_INTERACTIVE)
+   {
+@@ -963,6 +989,81 @@ void ObjectManager::device_update(Device *device,
+   }
+ }
+ 
++void ObjectManager::device_update_object_groups(Device * /*unused*/,
++                                                DeviceScene *dscene,
++                                                Scene *scene)
++{
++  /* Flatten the scene's groups into the two device arrays the kernel reads.
++   *
++   * These hold M member records plus N placement records, where a flattened
++   * scene needs N * M KernelObject records. The member's world transform is
++   * deliberately absent: it is composed from the placement transform and the
++   * member's group-local one during shading, and materialising it is exactly
++   * the cost this avoids. */
++  /* Matches the device-side opt-in; both must agree or hits resolve through the
++   * wrong records. */
++  const bool groups_enabled = (getenv("CYCLES_NESTED_SHARED") != nullptr);
++
++  if (!groups_enabled || scene->object_groups.empty() ||
++      scene->object_group_instances.empty())
++  {
++    dscene->group_members.free();
++    dscene->group_placements.free();
++    dscene->data.bvh.use_object_groups = 0;
++    return;
++  }
++  dscene->data.bvh.use_object_groups = 1;
++
++  size_t num_members = 0;
++  for (const ObjectGroup &group : scene->object_groups) {
++    num_members += group.members.size();
++  }
++
++  KernelGroupMember *kmembers = dscene->group_members.alloc(num_members);
++  size_t m = 0;
++  for (const ObjectGroup &group : scene->object_groups) {
++    for (const ObjectGroupMember &member : group.members) {
++      KernelGroupMember &kmember = kmembers[m++];
++      kmember.local = member.local;
++      /* Prototype object index: where the kernel finds this member's geometry
++       * offsets, shader and attribute map. */
++      kmember.object = (member.prototype != nullptr) ? member.prototype->get_device_index() :
++                                                       OBJECT_NONE;
++      kmember.pad1 = kmember.pad2 = kmember.pad3 = 0;
++    }
++  }
++
++  KernelGroupPlacement *kplacements = dscene->group_placements.alloc(
++      scene->object_group_instances.size());
++  for (size_t i = 0; i < scene->object_group_instances.size(); i++) {
++    const ObjectGroupInstance &instance = scene->object_group_instances[i];
++    KernelGroupPlacement &kplacement = kplacements[i];
++    kplacement.tfm = instance.tfm;
++    kplacement.random_id = instance.random_id;
++    kplacement.visibility = instance.visibility;
++    kplacement.group = instance.group;
++    kplacement.pad1 = 0;
++  }
++
++  dscene->group_members.copy_to_device();
++  dscene->group_placements.copy_to_device();
++
++  size_t num_resolved = 0;
++  for (size_t i = 0; i < num_members; i++) {
++    num_resolved += (kmembers[i].object != OBJECT_NONE) ? 1 : 0;
++  }
++  update_timing_log(
++      "      GROUPS: %zu groups, %zu members (%zu with prototypes, %.2f MB) + %zu placements "
++      "(%.2f MB)",
++                    scene->object_groups.size(),
++                    num_members,
++                    num_resolved,
++                    double(num_members * sizeof(KernelGroupMember)) / (1024.0 * 1024.0),
++                    scene->object_group_instances.size(),
++                    double(scene->object_group_instances.size() * sizeof(KernelGroupPlacement)) /
++                        (1024.0 * 1024.0));
++}
++
+ void ObjectManager::device_update_flags(Device * /*unused*/,
+                                         DeviceScene *dscene,
+                                         Scene *scene,
+@@ -1207,8 +1308,13 @@ void ObjectManager::apply_static_transforms(DeviceScene *dscene, Scene *scene, P
+      * Could be solved by moving reference counter to Geometry.
+      */
+     Geometry *geom = object->geometry;
+-    bool apply = (geometry_users[geom] == 1) && !geom->has_surface_bssrdf &&
+-                 !geom->has_true_displacement();
++    /* Never bake a transform into group prototype geometry. A prototype has one
++     * user by construction, so it would qualify -- and baking sets
++     * SD_OBJECT_TRANSFORM_APPLIED, which makes shading skip the instance normal
++     * transform entirely, so the placement transform would never reach the
++     * normals. */
++    bool apply = !object->is_group_prototype && (geometry_users[geom] == 1) &&
++                 !geom->has_surface_bssrdf && !geom->has_true_displacement();
+ 
+     if (geom->is_mesh()) {
+       Mesh *mesh = static_cast<Mesh *>(geom);
+diff --git a/intern/cycles/scene/object.h b/intern/cycles/scene/object.h
+index 752c732fae3..334b31d863d 100644
+--- a/intern/cycles/scene/object.h
++++ b/intern/cycles/scene/object.h
+@@ -75,6 +75,20 @@ class Object : public Node {
+   NODE_SOCKET_API(uint, blocker_shadow_set)
+   NODE_SOCKET_API(uint64_t, shadow_set_membership)
+ 
++  /* Prototype for an object group member: carries geometry, shader and
++   * attribute data for a piece of a group, but is never drawn itself. Its
++   * transform is meaningless -- a member's world transform is composed from a
++   * placement transform and the member's group-local one.
++   *
++   * Excluded from tracing and from apply_transform, since baking a transform
++   * into shared prototype geometry would be wrong for every placement. */
++  bool is_group_prototype = false;
++
++  /* Produced by expanding an object group into flat objects. When the group's
++   * own acceleration structure is traced instead, these must not also appear at
++   * the top level or every member would be drawn twice. */
++  bool is_group_expanded = false;
++
+   /* Set during device update. */
+   bool intersects_volume;
+ 
+@@ -173,6 +187,8 @@ class ObjectManager {
+   void device_update_transforms(DeviceScene *dscene, Scene *scene, Progress &progress);
+   void device_update_prim_offsets(Device *device, DeviceScene *dscene, Scene *scene);
+ 
++  void device_update_object_groups(Device *device, DeviceScene *dscene, Scene *scene);
++
+   void device_update_flags(Device *device,
+                            DeviceScene *dscene,
+                            Scene *scene,
+diff --git a/intern/cycles/scene/objectgroup.h b/intern/cycles/scene/objectgroup.h
+new file mode 100644
+index 00000000000..969847c51a8
+--- /dev/null
++++ b/intern/cycles/scene/objectgroup.h
+@@ -0,0 +1,93 @@
++/* SPDX-FileCopyrightText: 2011-2022 Blender Foundation
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Object groups: a prototype instanced many times.
++ *
++ * A group is a piece of geometry that appears repeatedly under different world
++ * transforms -- a tree made of a trunk and many leaves, scattered across a
++ * forest. Today Cycles flattens that: N group instances holding M members each
++ * become N * M separate world-space Objects, so a thousand trees of a hundred
++ * thousand leaves is a hundred million Object records.
++ *
++ * Holding the structure instead costs N + M: one member record per prototype
++ * piece, one instance record per placement.
++ *
++ * Member transforms are GROUP-LOCAL. A member's world transform is
++ *
++ *   world = instance.tfm * member.local
++ *
++ * and it does not exist as stored data -- which is the entire point, since
++ * storing it is what costs N * M.
++ *
++ * Members are deliberately not Objects. An Object carries a world transform,
++ * a device index and a slot in every per-object device array, and materialising
++ * one per member would reintroduce the cost this exists to avoid. Members hold
++ * only what distinguishes one piece of the prototype from another. */
++
++#include "scene/geometry.h"
++
++#include "util/transform.h"
++#include "util/types.h"
++#include "util/vector.h"
++
++CCL_NAMESPACE_BEGIN
++
++/* Forward declared rather than included: scene.h includes this header, and
++ * object.h reaches scene.h, so including it here would be circular. */
++class Object;
++
++/* One piece of a prototype: a mesh placed somewhere inside the group. */
++struct ObjectGroupMember {
++  Geometry *geometry = nullptr;
++
++  /* Relative to the group origin, NOT to the world. */
++  Transform local = transform_identity();
++
++  /* The member's own ray visibility. Combined with the instance's, so a member
++   * can be hidden from camera rays inside a group that is not. */
++  uint visibility = ~0u;
++
++  bool is_shadow_catcher = false;
++
++  /* Object carrying this member's geometry, shader and attribute data. Never
++   * drawn directly; the kernel resolves prototype data through it. Its own
++   * transform is meaningless -- `local` above is the transform that matters. */
++  Object *prototype = nullptr;
++};
++
++/* A prototype. Referenced by many instances; never drawn on its own. */
++class ObjectGroup {
++ public:
++  vector<ObjectGroupMember> members;
++
++  /* Index in Scene::object_groups. Assigned during device update. */
++  int index = -1;
++};
++
++/* One placement of a group in the world.
++ *
++ * A plain struct, not a Node. There is one of these per visible instance --
++ * potentially millions -- so it must stay cheap to create and copy. Socket
++ * level dirty tracking would cost an allocation each, which defeats the
++ * purpose. */
++struct ObjectGroupInstance {
++  /* Index into Scene::object_groups. */
++  int group = -1;
++
++  /* World transform of the group origin. */
++  Transform tfm = transform_identity();
++
++  uint visibility = ~0u;
++
++  /* Seed for per-instance variation. Combined with a member index at shade
++   * time to give per-member randomness without storing N * M values. */
++  uint random_id = 0;
++
++  bool use_holdout = false;
++  bool is_shadow_catcher = false;
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/scene/scene.cpp b/intern/cycles/scene/scene.cpp
+index cf58010de51..48c7c022096 100644
+--- a/intern/cycles/scene/scene.cpp
++++ b/intern/cycles/scene/scene.cpp
+@@ -26,6 +26,7 @@
+ #include "scene/scene.h"
+ #include "scene/scene_attributes.h"
+ #include "scene/shader.h"
++#include "scene/stats.h"
+ #include "scene/svm.h"
+ #include "scene/tables.h"
+ #include "scene/volume.h"
+@@ -35,6 +36,7 @@
+ #include "util/guarded_allocator.h"
+ #include "util/log.h"
+ #include "util/progress.h"
++#include "util/update_timing.h"
+ 
+ CCL_NAMESPACE_BEGIN
+ 
+@@ -179,6 +181,24 @@ void Scene::device_update(Device *device_, Progress &progress)
+     device = device_;
+   }
+ 
++  /* Phase 1 instrumentation. Every manager already records fine-grained timings
++   * into update_stats, but it is only enabled for background F12 renders. Turn
++   * it on for the viewport too and dump the report on scope exit, so the early
++   * returns below are still covered. */
++  const UpdateScopedTimer timing_scene("  Scene::device_update TOTAL");
++  if (update_timing_enabled() && !update_stats) {
++    enable_update_stats();
++  }
++  struct UpdateStatsDumper {
++    SceneUpdateStats *stats;
++    ~UpdateStatsDumper()
++    {
++      if (stats != nullptr) {
++        update_timing_write(stats->full_report().c_str());
++      }
++    }
++  } timing_dump{update_timing_enabled() ? update_stats.get() : nullptr};
++
+   const bool print_stats = need_data_update();
+   bool kernels_reloaded = false;
+ 
+@@ -293,7 +313,11 @@ void Scene::device_update(Device *device_, Progress &progress)
+ 
+   /* Update objects after geometry preprocessing. */
+   progress.set_status("Updating Objects");
+-  object_manager->device_update(device, &dscene, this, progress);
++  {
++    /* Rewrites the KernelObject array for every object in the scene. */
++    const UpdateScopedTimer t("    ObjectManager::device_update");
++    object_manager->device_update(device, &dscene, this, progress);
++  }
+ 
+   if (progress.get_cancel() || device->have_error()) {
+     return;
+@@ -308,13 +332,24 @@ void Scene::device_update(Device *device_, Progress &progress)
+ 
+   /* Camera and shaders must be ready here for adaptive subdivision and displacement. */
+   progress.set_status("Updating Meshes");
+-  geometry_manager->device_update(device, &dscene, this, progress);
++  {
++    /* Contains device_update_bvh, i.e. the OptiX TLAS build. */
++    const UpdateScopedTimer t("    GeometryManager::device_update");
++    geometry_manager->device_update(device, &dscene, this, progress);
++  }
+ 
+   if (progress.get_cancel() || device->have_error()) {
+     return;
+   }
+ 
+   /* Update object flags with final geometry. */
++  progress.set_status("Updating Object Groups");
++  object_manager->device_update_object_groups(device, &dscene, this);
++
++  if (progress.get_cancel() || device->have_error()) {
++    return;
++  }
++
+   progress.set_status("Updating Objects Flags");
+   object_manager->device_update_flags(device, &dscene, this, progress);
+ 
+diff --git a/intern/cycles/scene/scene.h b/intern/cycles/scene/scene.h
+index 613e3414e12..2c10ee2fd85 100644
+--- a/intern/cycles/scene/scene.h
++++ b/intern/cycles/scene/scene.h
+@@ -9,6 +9,7 @@
+ #include "scene/devicescene.h"
+ #include "scene/film.h"
+ #include "scene/image.h"
++#include "scene/objectgroup.h"
+ #include "scene/scene_attributes.h"
+ #include "scene/shader.h"
+ 
+@@ -162,6 +163,18 @@ class Scene : public NodeOwner {
+   unique_ptr_vector<Object> objects;
+   unique_ptr_vector<Procedural> procedurals;
+ 
++  /* Object groups: prototypes plus their placements. See scene/objectgroup.h.
++   *
++   * Rebuilt from scratch by the sync layer each update, so these are plain
++   * vectors rather than unique_ptr_vector -- nothing outside the scene holds a
++   * pointer into them between syncs.
++   *
++   * While the device cannot consume groups directly, expand_object_groups()
++   * turns them back into flat Objects and these stay empty afterwards, so every
++   * existing path over `objects` behaves exactly as before. */
++  vector<ObjectGroup> object_groups;
++  vector<ObjectGroupInstance> object_group_instances;
++
+   /* data managers */
+   unique_ptr<ImageManager> image_manager;
+   unique_ptr<LightManager> light_manager;
+diff --git a/intern/cycles/util/update_timing.h b/intern/cycles/util/update_timing.h
+new file mode 100644
+index 00000000000..14c489a4b73
+--- /dev/null
++++ b/intern/cycles/util/update_timing.h
+@@ -0,0 +1,126 @@
++/* SPDX-FileCopyrightText: 2011-2022 Blender Foundation
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Scene update timing instrumentation.
++ *
++ * Temporary measurement scaffolding for the cycles-incremental-updates branch.
++ * Cycles' own SceneUpdateStats is only enabled for background F12 renders
++ * (blender/session.cpp), so it cannot see the interactive viewport path, which
++ * is exactly the path we need to profile.
++ *
++ * Disabled unless CYCLES_UPDATE_TIMING is set to a writable file path, e.g.
++ *
++ *   set CYCLES_UPDATE_TIMING=D:\tmp\cycles_timing.log
++ *
++ * When unset, update_timing_file() returns null on the first call and every
++ * macro below compiles down to a null check, so there is no measurable cost.
++ *
++ * Remove before this branch is considered for upstream. */
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++
++#include "util/thread.h"
++#include "util/time.h"
++
++CCL_NAMESPACE_BEGIN
++
++inline thread_mutex &update_timing_mutex()
++{
++  static thread_mutex mutex;
++  return mutex;
++}
++
++inline FILE *update_timing_file()
++{
++  static FILE *file = []() -> FILE * {
++    const char *path = getenv("CYCLES_UPDATE_TIMING");
++    if (path == nullptr || path[0] == '\0') {
++      return nullptr;
++    }
++    FILE *f = fopen(path, "a");
++    if (f != nullptr) {
++      fprintf(f, "\n=== cycles update timing session start ===\n");
++      fflush(f);
++    }
++    return f;
++  }();
++  return file;
++}
++
++inline bool update_timing_enabled()
++{
++  return update_timing_file() != nullptr;
++}
++
++/* Monotonically increasing id so lines belonging to one viewport update can be
++ * grouped together when reading the log. */
++inline int update_timing_event_id(const bool advance = false)
++{
++  static int id = 0;
++  if (advance) {
++    id++;
++  }
++  return id;
++}
++
++inline void update_timing_log(const char *fmt, ...)
++{
++  FILE *file = update_timing_file();
++  if (file == nullptr) {
++    return;
++  }
++  const thread_scoped_lock lock(update_timing_mutex());
++  fprintf(file, "[%04d] ", update_timing_event_id());
++  va_list args;
++  va_start(args, fmt);
++  vfprintf(file, fmt, args);
++  va_end(args);
++  fputc('\n', file);
++  fflush(file);
++}
++
++/* Write text verbatim. Use this for multi-line reports, which may contain '%'
++ * and must not go through a format string. */
++inline void update_timing_write(const char *text)
++{
++  FILE *file = update_timing_file();
++  if (file == nullptr) {
++    return;
++  }
++  const thread_scoped_lock lock(update_timing_mutex());
++  fprintf(file, "[%04d] ---- manager report ----\n%s\n", update_timing_event_id(), text);
++  fflush(file);
++}
++
++/* Times its own lifetime and logs "<label>: N.NN ms" when it goes out of
++ * scope. Constructing one when timing is disabled does nothing. */
++class UpdateScopedTimer {
++ public:
++  explicit UpdateScopedTimer(const char *label) : label_(label)
++  {
++    if (update_timing_enabled()) {
++      start_ = time_dt();
++    }
++  }
++
++  ~UpdateScopedTimer()
++  {
++    if (start_ != 0.0) {
++      update_timing_log("%-44s %8.2f ms", label_, (time_dt() - start_) * 1000.0);
++    }
++  }
++
++  UpdateScopedTimer(const UpdateScopedTimer &) = delete;
++  UpdateScopedTimer &operator=(const UpdateScopedTimer &) = delete;
++
++ private:
++  const char *label_;
++  double start_ = 0.0;
++};
++
++CCL_NAMESPACE_END
+diff --git a/scripts/startup/bl_ui/properties_object.py b/scripts/startup/bl_ui/properties_object.py
+index ab3b35e4d7a..ef0b418b833 100644
+--- a/scripts/startup/bl_ui/properties_object.py
++++ b/scripts/startup/bl_ui/properties_object.py
+@@ -437,6 +437,7 @@ class OBJECT_PT_visibility(ObjectButtonsPanel, Panel):
+         col = layout.column(heading="Show In")
+         col.prop(ob, "hide_viewport", text="Viewports", toggle=False, invert_checkbox=True)
+         col.prop(ob, "hide_render", text="Renders", toggle=False, invert_checkbox=True)
++        col.prop(ob, "hide_rasterizer", text="Solid/EEVEE Viewports", toggle=False, invert_checkbox=True)
+ 
+         if context.engine == 'BLENDER_EEVEE':
+             if ob.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT', 'CURVES', 'POINTCLOUD', 'VOLUME'}:
+diff --git a/source/blender/depsgraph/intern/depsgraph_query_iter.cc b/source/blender/depsgraph/intern/depsgraph_query_iter.cc
+index 663aeb66851..a52f4af9b62 100644
+--- a/source/blender/depsgraph/intern/depsgraph_query_iter.cc
++++ b/source/blender/depsgraph/intern/depsgraph_query_iter.cc
+@@ -103,6 +103,30 @@ void deg_iterator_duplis_init(DEGObjectIterData *data, Object *object)
+   data->dupli_object_next_index = 0;
+ }
+ 
++/* Objects tagged as Cycles render-instance sources have their instances read
++ * directly by the render engine from the evaluated geometry set. Expanding
++ * them into a DupliObject list here would be pure duplicate work: the engine
++ * would receive every instance twice, and the expansion this whole path exists
++ * to avoid would still be paid.
++ *
++ * Note this deliberately lives in the iterator rather than in the engine --
++ * the engine cannot prevent the expansion, because the iterator drives it. */
++static bool deg_object_skips_dupli_expansion(const Object *object)
++{
++  const ID *id = &object->id;
++  if (id->properties == nullptr) {
++    return false;
++  }
++  const IDProperty *prop = IDP_GetPropertyFromGroup(id->properties, "cycles_render_instancer");
++  if (prop == nullptr) {
++    return false;
++  }
++  if (prop->type != IDP_BOOLEAN && prop->type != IDP_INT) {
++    return false;
++  }
++  return prop->data.val != 0;
++}
++
+ /* Returns false when iterator is exhausted. */
+ bool deg_iterator_duplis_step(DEGObjectIterData *data)
+ {
+@@ -247,7 +271,8 @@ bool deg_iterator_objects_step(DEGObjectIterData *data)
+ 
+     if (ob_visibility & OB_VISIBLE_INSTANCES) {
+       if ((data->flag & DEG_ITER_OBJECT_FLAG_DUPLI) &&
+-          ((object->transflag & OB_DUPLI) || object->runtime->geometry_set_eval != nullptr))
++          ((object->transflag & OB_DUPLI) || object->runtime->geometry_set_eval != nullptr) &&
++          !deg_object_skips_dupli_expansion(object))
+       {
+         BLI_assert(deg::deg_validate_eval_copy_datablock(&object->id));
+         object_duplilist(data->graph, object, data->settings->included_objects, data->dupli_list);
+diff --git a/source/blender/draw/intern/draw_context.cc b/source/blender/draw/intern/draw_context.cc
+index d5b4a97f272..caf0d5810f3 100644
+--- a/source/blender/draw/intern/draw_context.cc
++++ b/source/blender/draw/intern/draw_context.cc
+@@ -1549,6 +1549,21 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
+                                 gpencil_engine_needed;
+ 
+   auto should_draw_object = [&](Object &ob, bool /*has_duplis*/) -> DrawFilter {
++    /* "Render engine only" display (OB_HIDE_RASTERIZER): never add this object's
++     * geometry to the DRW (OpenGL/Vulkan) path in ANY viewport -- neither the
++     * rasterizer surface (Solid/Wireframe/Material Preview/EEVEE) nor the overlay
++     * pass. External render engines such as Cycles sync objects through their own
++     * depsgraph walk (not this predicate), so the object (and all its instances)
++     * still render and stay visible in a Cycles Rendered viewport.
++     *
++     * SkipRecursive is essential for the main use case -- an instancer producing
++     * huge numbers of duplis: it culls the ENTIRE dupli set in one decision, so
++     * object_duplilist() is never called and none of the (potentially millions
++     * of) instances are generated or drawn by the rasterizer. On a plain object
++     * with no duplis this is equivalent to Skip. Select it via the Outliner. */
++    if (ob.visibility_flag & OB_HIDE_RASTERIZER) {
++      return DrawFilter::SkipRecursive;
++    }
+     return BKE_object_is_visible_in_viewport(v3d, &ob) ? DrawFilter::Draw : DrawFilter::Skip;
+   };
+ 
+diff --git a/source/blender/makesdna/DNA_object_types.h b/source/blender/makesdna/DNA_object_types.h
+index 4359baff80e..b9019a5462f 100644
+--- a/source/blender/makesdna/DNA_object_types.h
++++ b/source/blender/makesdna/DNA_object_types.h
+@@ -249,6 +249,10 @@ enum eObject_VisibilityFlag : int {
+   OB_HIDE_PROBE_PLANAR = 1 << 13,
+   OB_HIDE_SURFACE_PICK = 1 << 14,
+   OB_HIDE_RAYCAST = 1 << 15,
++  /* Hide from the rasterizer viewports (Solid/Wireframe/EEVEE) only. The object
++   * is still drawn by render engines such as Cycles (F12 and the Rendered
++   * viewport), so very heavy objects need not choke the OpenGL/Vulkan viewport. */
++  OB_HIDE_RASTERIZER = 1 << 16,
+ };
+ ENUM_OPERATORS(eObject_VisibilityFlag)
+ 
+diff --git a/source/blender/makesrna/intern/rna_object.cc b/source/blender/makesrna/intern/rna_object.cc
+index 3661c45587a..d5178d95714 100644
+--- a/source/blender/makesrna/intern/rna_object.cc
++++ b/source/blender/makesrna/intern/rna_object.cc
+@@ -2850,6 +2850,16 @@ static void rna_def_object_visibility(StructRNA *srna)
+   RNA_def_property_ui_icon(prop, ICON_RESTRICT_RENDER_OFF, -1);
+   RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Object_hide_update");
+ 
++  prop = RNA_def_property(srna, "hide_rasterizer", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(prop, nullptr, "visibility_flag", OB_HIDE_RASTERIZER);
++  RNA_def_property_ui_text(
++      prop,
++      "Disable in Solid/EEVEE Viewports",
++      "Do not draw in the Solid, Wireframe and EEVEE viewports, but still show in render "
++      "engines such as Cycles (the Rendered viewport and final renders). Lets very heavy "
++      "objects render without loading the OpenGL/Vulkan viewport");
++  RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Object_internal_update_draw");
++
+   prop = RNA_def_property(srna, "hide_probe_volume", PROP_BOOLEAN, PROP_NONE);
+   RNA_def_property_boolean_sdna(prop, nullptr, "visibility_flag", OB_HIDE_PROBE_VOLUME);
+   RNA_def_property_ui_text(prop, "Disable in Volume Probes", "Globally disable in volume probes");
