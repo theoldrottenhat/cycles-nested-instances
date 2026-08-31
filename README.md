@@ -1,23 +1,39 @@
 # Cycles nested instancing — Blender 5.2
 
-Cycles renders scattered geometry without flattening it. 210 trees × 100,172
-leaves — 21 million instances from **38 MB instead of 7.1 GB**.
+Three separate switches. **NVIDIA RTX only** (OptiX), Windows.
 
-**NVIDIA RTX only** (OptiX), Windows.
+| | switched by | what it gives you |
+|---|---|---|
+| Render instances directly | per-object checkbox | faster sync on big scatters |
+| Nested instancing | environment variable | the memory win — needs the above |
+| Solid/EEVEE viewports off | per-object checkbox | bonus for very heavy scatters |
 
-## Use the prebuilt Blender
+## Setup
 
 1. Download the zip from [Releases](../../releases) and unzip it.
-2. Put `run-with-nested-instancing.cmd` next to `blender.exe`, and start Blender
-   with it.
+2. Put `run-with-nested-instancing.cmd` next to `blender.exe` and start Blender
+   with it. It sets `CYCLES_NESTED_SHARED=1`, which is what turns nesting on.
 3. On each scattering object: **Object Properties → Visibility → Render
    Instances Directly**.
 
-Step 3 is required, per object. Without it that object renders the ordinary way.
+## What each one does
 
-Optional, same panel under **Show In**: untick **Solid/EEVEE Viewports**. The
-object vanishes from the Solid, Wireframe and EEVEE viewports but still renders
-in Cycles — use it when a scatter is too heavy for the normal viewport.
+**Render instances directly** — step 3, per object. Cycles reads
+geometry-nodes instances straight from the evaluated geometry instead of having
+the depsgraph expand them into real duplicates first. A speedup in its own
+right: big scatters sync, and re-sync after every edit, far faster. Also the
+foundation nesting is built on.
+
+**Nested instancing** — step 2, the environment variable. Stops Cycles
+flattening scattered geometry into one record per leaf per tree. 210 trees ×
+100,172 leaves — 21 million instances from **38 MB instead of 7.1 GB**. Only
+applies to objects that have the toggle above.
+
+**Solid/EEVEE viewports off** — optional, same panel under **Show In**. The
+normal viewport builds real geometry for every instance and will stall or run
+out of memory long before Cycles would. Untick it and the object vanishes from
+the Solid, Wireframe and EEVEE viewports while still rendering in Cycles.
+Select it from the Outliner while it's hidden.
 
 ## Or build it yourself
 
