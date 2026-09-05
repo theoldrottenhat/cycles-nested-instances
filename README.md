@@ -24,6 +24,9 @@ the depsgraph expand them into real duplicates first. A speedup in its own
 right: big scatters sync, and re-sync after every edit, far faster. Also the
 foundation nesting is built on.
 
+Works on collection instances too. Tick it on the empty and the whole
+collection is read directly, including collection instances nested inside it.
+
 **Nested instancing** — step 2, the environment variable. Stops Cycles
 flattening scattered geometry into one record per leaf per tree. 210 trees ×
 100,172 leaves — 21 million instances from **38 MB instead of 7.1 GB**. Only
@@ -51,6 +54,22 @@ Visual Studio 2022, CUDA 13.3, OptiX 9.1.0.
 
 GPL, like Blender. Patch applies to Blender `v5.2.0` (`fbe6228777e7`).
 See `EXPLAINER-nested-instancing.md`.
+
+## Since the first release
+
+- Collection instances work. Ticking the box on one used to make it disappear,
+  and a collection instance nested inside an instanced collection was dropped
+  even with the box left alone.
+- Moving a collection instance during a render updates it live, instead of
+  waiting for the render to restart.
+- Geometry-nodes instances no longer render black with the box ticked.
+- Box-select, and the other viewport passes, respect the Solid/EEVEE toggle.
+  Selecting over a heavy scatter went from about 850 ms to 4 ms.
+- Groups and prototypes are kept between viewport updates rather than rebuilt,
+  so moving the camera over a heavy scatter costs ~14 ms instead of ~141 ms.
+- Several crashes fixed: removing an object from an instanced collection,
+  deleting an instancer mid-render, and instancer data being matched to the
+  wrong object after an undo.
 
 ## Left to do
 

@@ -1,3 +1,363 @@
+diff --git a/NOTES-cycles-incremental-updates.md b/NOTES-cycles-incremental-updates.md
+new file mode 100644
+index 00000000000..814725b3cc6
+--- /dev/null
++++ b/NOTES-cycles-incremental-updates.md
+@@ -0,0 +1,148 @@
++# cycles-incremental-updates
++
++Branch charter. Started 2026-08-27.
++
++## The goal, in plain language
++
++Think of the scene as a library with 370,000 books, plus a catalog telling the
++renderer where every book sits.
++
++You nudge `move_me` one pixel. One book moved. But Cycles does not track *which*
++things changed, only that *something* changed. So it rewrites the catalog card
++for all 370,000 books, ships the whole 126 MB catalog to the GPU, and tells the
++GPU to rebuild its entire index from scratch. Every nudge. Every pixel of the
++drag.
++
++The 370,000 flowers did not move. For 369,999 of them, all that work produced a
++byte-identical result.
++
++**Goal: make Cycles remember what actually changed, and only redo that.**
++
++Success, from the user's chair: dragging `move_me` during a Cycles viewport
++render feels responsive instead of laggy. Nothing about how the render *looks*
++changes. This is bookkeeping, not rendering.
++
++## What this is NOT
++
++This does not reduce how many things exist in the scene. 370,000 flowers still
++cost 370,000 slots. That is the *forest memory ceiling* (N trees x M leaves
++costing N*M records), and only nested instancing fixes it.
++
++Nested instancing is a separate, much larger project. It is explicitly out of
++scope here. The POC scaffolding for it was removed in the first commit on this
++branch.
++
++## Baseline: cost of one transform edit at 370k objects
++
++"Derived" = computed from struct layouts and code paths, not yet timed.
++"TBM" = to be measured in Phase 1.
++
++| Cost | Size / work | Basis |
++| --- | --- | --- |
++| `dscene.objects` rewrite + upload | 370k x 256 B = 94.7 MB | derived: `KernelObject` = 2x`Transform` (48 B) + 160 B fields, 16-byte aligned |
++| `dscene.object_flag` upload | 370k x 4 B = 1.5 MB | derived |
++| OptiX `instances` array | 370k x 80 B = 29.6 MB, host+device alloc *and* free every edit | derived, `device_impl.cpp` TLAS branch |
++| **Total upload per mouse-move frame** | **~126 MB** | |
++| CPU | 370k `transform_inverse` calls, every edit | `object.cpp device_update_object_transform` |
++| GPU | full `OPTIX_BUILD_OPERATION_BUILD` over 370k instances | `device_impl.cpp` TLAS branch |
++| Wall-clock per edit | TBM | Phase 1 |
++
++The 126 MB happens whether one object moved or all of them did: `device_vector`
++tracks dirtiness as a single `bool` (`device/memory.h`).
++
++### The key finding
++
++`geometry_bvh.cpp device_update_bvh` already computes `can_refit` and passes it
++into `build_bvh` for the top level. The BLAS branch honours it and uses
++`OPTIX_BUILD_OPERATION_UPDATE`. **The TLAS branch ignores the parameter and
++hardcodes a full rebuild** — and the viewport TLAS is already built with
++`OPTIX_BUILD_FLAG_ALLOW_UPDATE`. The capability is present and unused.
++
++## Success criteria
++
++1. Upload per single-object edit: ~126 MB -> under 1 MB. Primary gate.
++2. No full TLAS rebuild on transform-only edits.
++3. No 30 MB alloc/free churn; the instance buffer persists across updates.
++4. CPU pass no longer O(N) in scene object count.
++5. Wall-clock target: set as a hard number after Phase 1 measures it.
++6. **Zero pixel difference** vs the *Phase 0 baseline build on this branch* --
++   NOT vs the stable build, which is known-buggy (see Phase 0 outcome below).
++   Cheap to guarantee because Phases 2-3 change no kernel code.
++
++## Non-goals
++
++- Nested instancing / the forest memory ceiling.
++- CPU (Embree), HIP-RT, Metal BVH backends. Phase 2 is OptiX-only; Phase 3 is
++  backend-agnostic.
++- Any change to the two shipped features inherited from
++  `fix-collection-instances`.
++
++## Risks
++
++- **Refit quality decay.** OptiX IAS refit degrades as objects drift from their
++  build-time positions: rebuilds get cheaper but tracing gets slower. Needs a
++  deliberate policy (force a full rebuild past a movement threshold or refit
++  count), not a default.
++- **Structural change detection.** Refit is only valid when the instance set is
++  unchanged: same count, same BLAS handles, same visibility and SBT offsets.
++  Getting this predicate wrong is the one way to produce a wrong image.
++  Conservative default: anything ambiguous forces a full rebuild.
++- **Dirty-range granularity.** Scattered changed objects degenerate a contiguous
++  range back to the full array. May need a changed-index list instead. Phase 1
++  data decides.
++
++## Phases
++
++- **Phase 0** — branch, worktree, strip POC, clean baseline build. No behaviour
++  change.
++- **Phase 1** — env-gated timing instrumentation; measure where the time goes.
++  Cycles' built-in `update_stats` only works for F12 background renders, so it
++  is useless for the viewport case.
++- **Phase 2** — OptiX: persist the TLAS instance buffer; honour `refit` for the
++  top level.
++- **Phase 3** — `device_vector` dirty-range tracking; skip unchanged objects in
++  `ObjectManager`.
++- **Phase 4** — re-measure. Only if the TLAS is still the wall does nested
++  instancing become justified, and then as its own project.
++
++## Layout
++
++| | |
++| --- | --- |
++| Stable, do not touch | branch `fix-collection-instances`, build dir `build_windows_Release_x64_vc17_Release` |
++| This branch | `cycles-incremental-updates`, cut from `fix-collection-instances` @ 38d9c414734 |
++| Worktree | `D:\blender-git\cycles-incremental-updates` |
++| Build dir | `D:\blender-git\build_windows_cycles-incremental-updates` |
++| Executable | `blender-cycles-incremental-updates.exe` |
++| Libraries | NOT duplicated. `-DLIBDIR=D:/blender-git/blender/lib/windows_x64` points at the stable tree's submodule, read-only. Saves 6.7 GB on a QLC SSD and guarantees both builds link byte-identical libs. Breaks only if that folder is deleted. |
++| Config deviation | `WITH_CYCLES_DEVICE_ONEAPI` and `WITH_CYCLES_DEVICE_HIPRT` OFF (stable has them ON). Intel-GPU kernels are useless on an RTX 4090 and HIP produces nothing without `hipcc`. Everything affecting OptiX / CUDA / CPU matches stable exactly, `sm_89` included. |
++
++## Phase 0 outcome (2026-08-27)
++
++Baseline built clean: 0 errors, all 9 OptiX PTX modules + `kernel_sm_89.cubin`
++installed, OptiX and CUDA both enumerate the RTX 4090.
++
++### Bug found in the stable build
++
++The nested-instancing POC was described as dormant because its *host* code was
++`getenv`-gated. Its *kernel* code was not. In `fix-collection-instances`:
++
++- `kernel/device/optix/bvh.h` unconditionally calls
++  `optixGetObjectToWorldTransformMatrix` on every closest hit and writes 9 floats
++  into the integrator state SOA.
++- `kernel/integrator/shade_surface.h` reads them back and, when row0 is non-zero
++  (effectively always), transforms shading normals via
++  `transform_direction(object_to_world, N)`.
++
++The correct path, `object_normal_transform`, uses the inverse transpose
++(`transform_direction_transposed` on the inverse transform). These agree only for
++rotation plus uniform scale. **Any object with non-uniform scale or shear gets
++wrong shading normals in the stable build**, plus a per-hit cost.
++
++Removing the POC fixes both. Evidence: `kernel_optix.ptx.zst` shrank from 80,426
++to 77,952 bytes.
++
++Consequence: renders from this branch will differ from -- and be more correct
++than -- the stable build on non-uniformly-scaled objects. That is a fix, not a
++regression, and it is why criterion 6 references this baseline rather than
++stable.
+diff --git a/NOTES-nested-instancing-plan.md b/NOTES-nested-instancing-plan.md
+new file mode 100644
+index 00000000000..72350b6dcc0
+--- /dev/null
++++ b/NOTES-nested-instancing-plan.md
+@@ -0,0 +1,200 @@
++# Nested instancing — implementation plan
++
++Companion to NOTES-cycles-incremental-updates.md. Written 2026-08-29 after a
++five-agent analysis of the render chain.
++
++## Verdict
++
++Build it, OptiX first. The BVH work is the easy quarter — enabling nested
++traversal is two lines of pipeline config. **The project is the object model.**
++
++Collapsing only the OptiX instance array (80 B/object) wins ~24% of memory and
++none of the sync cost. The prize is collapsing Cycles' object array
++(`KernelObject`, 256 B). That needs the kernel to resolve identity and transform
++from an OUTER and an INNER id instead of one flat index. Both ids are available
++at hit time; ~105 call sites read the flat one.
++
++## Measured baseline (OptiX, background sync, this machine)
++
++Linear in flattened object count. 336 B per object (256 KernelObject + 80
++OptixInstance).
++
++| forest (100k leaves/tree) | flattened | sync | obj+inst memory |
++| --- | --- | --- | --- |
++| 1 tree | 600,628 | 0.6 s | 192 MB |
++| 10 trees | 1,202,076 | 1.1 s | 385 MB |
++| 100 trees | 10,017,300 | 7.6 s | 3.21 GB |
++| 1,000 trees (projected) | 100,000,000 | ~76 s | 33.6 GB — over VRAM |
++
++Nested, that 1,000-tree forest is 1,000 + 100,000 = 101,000 records (~34 MB).
++**990x reduction.**
++
++GeometryManager at 10M objects: attributes 2404 ms, TLAS 1200 ms, compute bounds
++584 ms, apply static transforms 290 ms, **all unique-mesh work 3 ms**.
++
++## Design
++
++- `ObjectGroup` — members are real `Object`s whose `tfm` is GROUP-LOCAL. M total.
++- `ObjectGroupInstance` — plain struct, world transform + per-instance values. N total.
++- **Members must NOT be in `scene->objects`** — every manager loops that vector
++  assuming a world transform and non-null geometry. Keeping them out means
++  existing paths run byte-identically when no groups exist.
++- Seam already exists: `protos_by_handle` in `sync_render_instances` IS the
++  prototype table. The N*M line is `blender/object.cpp:873`,
++  `object->set_tfm(instance_tfm * proto.local)`.
++- Two ids: `optixGetInstanceId()` = innermost;
++  `optixGetInstanceIdFromHandle(optixGetTransformListHandle(0))` = outermost
++  (index 0 is outermost — verified from the SDK composition loop).
++- Transforms from hardware: `optixGetObjectToWorldTransformMatrix()` composes the
++  full stack, so world-space P is correct at any depth — **world-space noise
++  varies per tree, as in Karma**, with no stored per-instance value.
++- `random_id` composes: Blender's generator is already a hash chain over
++  `persistent_id` levels (`BLI_hash_int_2d`). One seed per outer instance + one
++  index per member; compute at shade time.
++- Fallback is free: add `BVH_LAYOUT_OPTIX_NESTED` at bit 14; `best_bvh_layout`
++  picks the highest supported bit. Leave it OUT of `BVH_LAYOUT_ALL` so
++  multi-device ANDs it away automatically.
++
++## Gates: how "zero pixel difference" is actually measured
++
++GPU renders are NOT bit-deterministic. Rendering the same build twice shows up
++to 1 channel in 307,200 differing by 1/255. File hashes are useless here for a
++second reason too: Blender stamps render metadata into the PNG, so the bytes
++differ every run even when pixels do not.
++
++So every gate below means: compare PIXEL arrays (see compare_renders.py), and
++require the result to be within a noise floor measured by rendering ONE build
++twice on the same scene. Some scenes come out bit-identical run to run; those
++are the sharp tests, because any difference there is real signal.
++
++## Test assets (all in D:lender-git, outside the repo)
++
++- `make_test_forest.py` — parametric forest generator. `--trees N --leaves M`,
++  plus `--skew` for the transform regression case.
++- `compare_renders.py` — pixel-array comparison, ignores PNG metadata.
++- `verify_phase1.sh` — renders a scene set under a tag.
++- `forest_skew.blend` — 42 trees x 121 leaves with rotation AND non-uniform scale
++  at BOTH levels. Verified sheared: max axis dot 0.5144 (0 = orthogonal).
++  **Shear needs a rotation BETWEEN the two scales.** Outer(R_a.S_a) x inner(S_b)
++  with no inner rotation just multiplies two diagonals and stays orthogonal —
++  the first version of this scene had that bug and was useless as a test.
++
++## Finding that changes Phase 2
++
++`object_fetch_transform` (kernel/geom/object.h) is ALREADY the single funnel for
++every transform read. All ~105 call sites — object_position_transform,
++object_normal_transform, object_dir_transform and the rest — resolve through it;
++only 8 places call it directly with a raw object id. So Phase 2's original goal
++("route transforms through one choke point") is largely already true.
++
++The real remaining kernel work is carrying BOTH ids from hit to shading, because:
++- All 8 OptiX payload registers are in use (p4 is dual-purpose: visibility in,
++  object out). A second id needs numPayloadValues 8 -> 9, costing a register on
++  every trace.
++- Shading runs OUTSIDE OptiX hit programs (wavefront), so the composed-transform
++  intrinsics are unavailable there. The outer id must be carried, not re-queried.
++- Packing (outer, inner) into one 32-bit int does NOT fit at the required scale:
++  100k trees needs 17 bits and 150k leaves needs 18 bits.
++
++So `Intersection` must gain a field and the integrator state an SOA entry.
++
++## RESULT (2026-08-29)
++
++Working, behind CYCLES_NESTED_SHARED. Measured on a 210-tree forest of 20022
++leaves each, 4.2M flattened instances:
++
++| | flat | grouped |
++| --- | --- | --- |
++| Cycles objects | 4,225,067 | 20,027 |
++| KernelObject memory | 1031.5 MB | 4.9 MB |
++| Scene sync | 3224 ms | 170 ms |
++| wall clock | 8 s | 2 s |
++
++211x fewer objects, 210x less memory, 19x faster sync, same image.
++
++Correctness checked against the flat path on three scenes; residual is 3-24
++channels of 307200, which is float rounding (CPU-composed transform at sync
++time vs GPU-composed at shade time), not logic. The sheared scene - rotation
++and non-uniform scale at BOTH levels - matches, which is the meaningful test
++since a wrong inverse-transpose is invisible under uniform scale.
++
++Remaining: per-instance variation (random_id etc. still come from the
++prototype, so placements are clones), a correctness sweep (self-intersection
++keys, negative scale from the composed determinant), and removing the env
++gate.
++
++## Build order
++
++1. **Two-id plumbing, single level.** Split `get_object_id()`; widen intersection
++   identity. Fix the divergence first — the two existing branches read DIFFERENT
++   levels once nesting exists, and it depends on `__OBJECT_MOTION__`.
++   Gate: zero pixel diff, motion blur on and off.
++   DONE 2026-08-29, commit 091605eba97. Verified by rendering each scene through
++   each accessor: 3 of 4 pairs bit-identical, the 4th at exactly the noise floor.
++2. **Composed transforms through one choke point.** Route `object_fetch_transform`
++   through a matrix cached in `ShaderData`. Normals: inverse transpose of the
++   composed matrix, operand order NOT reversed. Compose then invert once.
++   Gate: zero pixel diff incl. non-uniform scale and shear.
++3. **Scene-level groups, expanded on sync.** Add the structures, expand back to
++   flat before device_update. This is the permanent fallback path.
++   Gate: zero pixel diff, identical object counts.
++4. **Nested layout + intermediate IAS.** Layout bit, `ALLOW_ANY`,
++   `maxTraversableGraphDepth` (3 call sites), one IAS per group. Give `BVHOptiX`
++   storage and hand it to `delayed_free_bvh_memory` — the step the POC skipped,
++   which is why it leaked every rebuild.
++   Gate: renders in the right places; VRAM stable across edits.
++5. **Resolve identity across both levels.** Prototype data from inner id,
++   per-instance from outer. `SD_OBJECT_NEGATIVE_SCALE` from the sign of the
++   composed determinant.
++   Gate: forest renders correctly, per-tree AND per-leaf variation present.
++6. **Collapse the object array.** Split `KernelObject` into per-prototype and
++   slim per-instance records. This is where the 990x actually arrives.
++   Gate: re-run the ladder; memory decouples from leaf count.
++
++## v1 scope
++
++IN: single OptiX GPU, two levels, mixed geometry per group, per-tree and per-leaf
++variation, emissive prototypes (light tree already does M+N), automatic flat
++fallback elsewhere.
++
++DEFERRED: CPU/Embree (blocked upstream — bundled
++`RTC_MAX_INSTANCE_LEVEL_COUNT 1`, compile-time ABI setting; Sam confirmed CPU is
++not a priority), HIP-RT (API supports 4 levels, Cycles opts out at compile time —
++natural second backend), Metal (pins instance id to object index via a degenerate
++instance), multi-GPU, motion blur on nested levels, more than 2 levels.
++
++## Risks
++
++- **Self-intersection breaks silently.** `intersection_skip_self` keys on
++  (object, prim). Shared ids make a ray skip the same prim on a sibling copy.
++  Same for the SSS local-traversal filter. Fix: self key absorbs the outer id.
++- **`apply_static_transforms` corrupts group normals.** Bakes transforms when
++  geometry_users == 1 and sets a flag that makes shading SKIP the normal
++  transform. A group member looks single-user. Fix: force members non-baked.
++- **Non-uniform scale is a build-time trap.** The light tree re-walks every
++  triangle per non-uniformly-scaled instance. Composed transforms are non-uniform
++  far more often. Shows up as sync time, not memory.
++- **`ALLOW_ANY` costs the non-nested majority.** No two-level flag exists. Cycles
++  already ships ALLOW_ANY with motion blur, so bounded but unmeasured. Keep the
++  flag dynamic.
++- **Visibility mask is 8 bits, already crowded.** Composes conjunctively in
++  hardware. Union on outer, exact on inner.
++- **Emitter identity is a single int.** Widening it is the broadest change in the
++  light path and crosses into the shadow-link intersection filter. Fallback: inner
++  instances inherit the outer group's light/shadow sets.
++
++## Independent track (no nesting needed)
++
++~3300 ms of the 4481 ms GeometryManager cost:
++
++- Early-out the object-attribute path when nothing requests object attributes.
++- Parallelise or skip `compute bounds` (serial; `Object::bounds` has 4 consumers,
++  none the OptiX TLAS).
++- Replace the `std::map` in `apply_static_transforms` with a per-Geometry counter.
++- Fix the mis-scoped `device_update (tangents)` timer (`geometry.cpp:869`,
++  declared at function scope so it reports the whole function). Upstream bug,
++  worth reporting to Blender.
++
++Caveat: the 2404 ms attribute saving is measured on a synthetic forest with no
++instance attributes. Real scatter work has them, and then it is genuine N*M data
++that only nesting reduces. Upper bound, not a promise.
 diff --git a/intern/cycles/blender/addon/properties.py b/intern/cycles/blender/addon/properties.py
 index e644ccb9248..a3f1ce9e661 100644
 --- a/intern/cycles/blender/addon/properties.py
@@ -55,8 +415,37 @@ index 80799e48f79..f26c8e114e6 100644
  
  class CYCLES_OBJECT_PT_visibility_ray_visibility(CyclesButtonsPanel, Panel):
      bl_label = "Ray Visibility"
+diff --git a/intern/cycles/blender/geometry.cpp b/intern/cycles/blender/geometry.cpp
+index f6fd69a479d..e291b839992 100644
+--- a/intern/cycles/blender/geometry.cpp
++++ b/intern/cycles/blender/geometry.cpp
+@@ -98,7 +98,8 @@ array<Node *> BlenderSync::find_used_shaders(blender::Object &b_ob)
+ Geometry *BlenderSync::sync_geometry(BObjectInfo &b_ob_info,
+                                      bool object_updated,
+                                      bool use_particle_hair,
+-                                     TaskPool *task_pool)
++                                     TaskPool *task_pool,
++                                     const array<Node *> *shader_override)
+ {
+   /* Test if we can instance or if the object is modified. */
+   const Geometry::Type geom_type = determine_geom_type(b_ob_info, use_particle_hair);
+@@ -108,8 +109,12 @@ Geometry *BlenderSync::sync_geometry(BObjectInfo &b_ob_info,
+                                     b_ob_info.object_data;
+   const GeometryKey key(b_key_id, geom_type);
+ 
+-  /* Find shader indices. */
+-  array<Node *> used_shaders = find_used_shaders(*b_ob_info.iter_object);
++  /* Find shader indices. A caller that knows better -- geometry-nodes output,
++   * whose materials are on the mesh rather than on any object -- supplies them,
++   * because they must be in place before the mesh is read. */
++  array<Node *> used_shaders = (shader_override != nullptr) ? *shader_override :
++                                                              find_used_shaders(
++                                                                  *b_ob_info.iter_object);
+ 
+   /* Ensure we only sync instanced geometry once. */
+   Geometry *geom = geometry_map.find(key);
 diff --git a/intern/cycles/blender/object.cpp b/intern/cycles/blender/object.cpp
-index 319aa849515..96f16a2f66e 100644
+index 319aa849515..2766bbd0c3d 100644
 --- a/intern/cycles/blender/object.cpp
 +++ b/intern/cycles/blender/object.cpp
 @@ -21,8 +21,14 @@
@@ -74,7 +463,7 @@ index 319aa849515..96f16a2f66e 100644
  #include "BKE_layer.hh"
  #include "BKE_material.hh"
  #include "BKE_object.hh"
-@@ -458,6 +464,764 @@ bool BlenderSync::sync_object_attributes(blender::Object &b_ob,
+@@ -458,6 +464,999 @@ bool BlenderSync::sync_object_attributes(blender::Object &b_ob,
    return changed;
  }
  
@@ -87,6 +476,29 @@ index 319aa849515..96f16a2f66e 100644
 + *
 + * M0: position and uniform scale only. No orient, collections, materials or
 + * motion blur yet. */
++
++/* A name for an instancer that survives the evaluated object being rebuilt.
++ *
++ * Everything this file keeps between syncs -- an instancer's objects, its
++ * prototypes, where its placements live -- was keyed on the address of the
++ * evaluated object. That address is not an identity. Every undo step frees the
++ * whole evaluated copy and builds it again, and an address released by one
++ * object is promptly handed to another, so after an undo a lookup can match a
++ * set belonging to an object that no longer exists. The group-reuse path then
++ * takes the hit as proof that nothing changed and skips the rebuild entirely,
++ * for an object it has in truth never seen.
++ *
++ * session_uid is Blender's answer to precisely this: documented to stay the
++ * same across reallocation, undo included. The evaluated copy leaves it zeroed,
++ * so it has to be read from the original.
++ *
++ * Zero means no original, which no real instancer has; such an object simply
++ * never matches a stored set and takes the full rebuild, which is correct. */
++unsigned int BlenderSync::render_instancer_id(blender::Object &b_ob)
++{
++  const blender::Object *b_orig = blender::DEG_get_original(&b_ob);
++  return (b_orig != nullptr) ? b_orig->id.session_uid : 0;
++}
 +
 +bool BlenderSync::object_is_render_instancer(blender::Object &b_ob)
 +{
@@ -106,10 +518,24 @@ index 319aa849515..96f16a2f66e 100644
 +  if (prop->data.val == 0) {
 +    return false;
 +  }
-+  /* Only meaningful when geometry nodes actually produced unrealized
-+   * instances for us to read. */
++  /* Meaningful when geometry nodes produced unrealized instances for us to
++   * read... */
 +  const blender::bke::GeometrySet *b_geometry_set = b_ob.runtime->geometry_set_eval;
-+  return b_geometry_set != nullptr && b_geometry_set->has_instances();
++  if (b_geometry_set != nullptr && b_geometry_set->has_instances()) {
++    return true;
++  }
++
++  /* ...and for a collection instance, which never appears in a geometry set at
++   * all. An empty with no modifiers gets no geometry evaluation whatsoever
++   * (DepsgraphNodeBuilder::build_empty_object returns early), so its instance
++   * lives in instance_collection and is expanded by make_duplis_collection.
++   *
++   * This test must agree with deg_object_skips_dupli_expansion(), which keyed
++   * off the property alone. When the two disagree the depsgraph stops
++   * expanding the instances and nothing here picks them up, so the object
++   * renders as nothing at all. */
++  return b_ob.instance_collection != nullptr &&
++         (b_ob.transflag & blender::OB_DUPLICOLLECTION) != 0;
 +}
 +
 +/* Flatten one instance reference into the geometry it actually draws, with
@@ -179,6 +605,19 @@ index 319aa849515..96f16a2f66e 100644
 +                                              depth + 1);
 +        }
 +      }
++
++      /* The referenced object may be a collection instance, which lives outside
++       * the geometry set read above. Same gap as for collection members. */
++      if (b_proto->instance_collection != nullptr &&
++          (b_proto->transflag & blender::OB_DUPLICOLLECTION) != 0)
++      {
++        render_instances_collect_prototypes(
++            blender::bke::InstanceReference(*b_proto->instance_collection),
++            local,
++            b_instancer,
++            r_protos,
++            depth + 1);
++      }
 +      return;
 +    }
 +
@@ -189,29 +628,36 @@ index 319aa849515..96f16a2f66e 100644
 +      if (b_mesh != nullptr) {
 +        blender::ID *b_mesh_id = const_cast<blender::ID *>(&b_mesh->id);
 +        BObjectInfo b_proto_info{&b_instancer, &b_instancer, b_mesh_id, false};
-+        Geometry *geometry = sync_geometry(b_proto_info, false, false, nullptr);
-+        if (geometry) {
-+          /* sync_geometry resolves materials from the *object's* slots
-+           * (find_used_shaders, geometry.cpp:112). The instancer has none, so
-+           * anonymous geometry would silently render with the default shader.
-+           * Its materials live on the mesh itself, so resolve them from there.
-+           * Slot order matches, so the per-face shader indices stay valid. */
-+          array<Node *> mesh_shaders;
-+          blender::Material *material_override = view_layer.material_override;
-+          for (int m = 0; m < b_mesh->totcol; m++) {
-+            if (material_override) {
-+              find_shader(&material_override->id, mesh_shaders, scene->default_surface);
-+            }
-+            else {
-+              find_shader(reinterpret_cast<blender::ID *>(b_mesh->mat[m]),
-+                          mesh_shaders,
-+                          scene->default_surface);
-+            }
-+          }
-+          if (!mesh_shaders.empty()) {
-+            geometry->set_used_shaders(mesh_shaders);
-+          }
 +
++        /* Resolve the materials BEFORE syncing, not after.
++         *
++         * sync_geometry resolves materials from the *object's* slots
++         * (find_used_shaders), and the instancer has none, so anonymous
++         * geometry would arrive with no shaders. That is not merely a wrong
++         * material: sync_mesh reads the geometry's shaders to decide which
++         * attributes to extract, so with none assigned it extracts none, and
++         * the mesh is read without the UVs and colour attributes its shader
++         * needs. Assigning them afterwards cannot fix that -- the mesh has
++         * already been read. The result renders black.
++         *
++         * The materials live on the mesh; slot order matches, so the per-face
++         * shader indices stay valid. */
++        array<Node *> mesh_shaders;
++        blender::Material *material_override = view_layer.material_override;
++        for (int m = 0; m < b_mesh->totcol; m++) {
++          if (material_override) {
++            find_shader(&material_override->id, mesh_shaders, scene->default_surface);
++          }
++          else {
++            find_shader(reinterpret_cast<blender::ID *>(b_mesh->mat[m]),
++                        mesh_shaders,
++                        scene->default_surface);
++          }
++        }
++
++        Geometry *geometry = sync_geometry(
++            b_proto_info, false, false, nullptr, mesh_shaders.empty() ? nullptr : &mesh_shaders);
++        if (geometry) {
 +          /* Anonymous geometry owns no object, so it carries no flags of its
 +           * own; everything comes from the instancer. */
 +          r_protos.push_back({geometry, local, PathRayVisibility(PATH_RAY_VISIBILITY_ALL), false});
@@ -267,15 +713,19 @@ index 319aa849515..96f16a2f66e 100644
 +                              Mesh::SUBDIVISION_NONE;
 +        BObjectInfo b_member_info{
 +            b_member, b_member, object_get_data(*b_member, adaptive), adaptive};
-+        if (!object_is_geometry(b_member_info)) {
-+          continue;
-+        }
-+        Geometry *geometry = sync_geometry(b_member_info, false, false, nullptr);
-+        if (geometry) {
-+          r_protos.push_back({geometry,
-+                              collection_local * get_transform(b_member->object_to_world()),
-+                              object_ray_visibility(*b_member),
-+                              (b_member->visibility_flag & blender::OB_SHADOW_CATCHER) != 0});
++        /* Realized geometry, if the member has any. A member with none must
++         * not skip the rest of this loop body: an empty standing in for a
++         * nested collection, or an object that is purely an instancer, carries
++         * everything it draws below. The Object case above takes the same care
++         * for the same reason. */
++        if (object_is_geometry(b_member_info)) {
++          Geometry *geometry = sync_geometry(b_member_info, false, false, nullptr);
++          if (geometry) {
++            r_protos.push_back({geometry,
++                                collection_local * get_transform(b_member->object_to_world()),
++                                object_ray_visibility(*b_member),
++                                (b_member->visibility_flag & blender::OB_SHADOW_CATCHER) != 0});
++          }
 +        }
 +
 +        /* A member may itself be an instancer, e.g. a collection holding a
@@ -303,6 +753,22 @@ index 319aa849515..96f16a2f66e 100644
 +                                                r_protos,
 +                                                depth + 1);
 +          }
++        }
++
++        /* A member that is itself a collection instance. It has no evaluated
++         * geometry set for the recursion above to find, so without this the
++         * entire nested collection is dropped -- an instanced collection that
++         * contains a collection instance renders as nothing. The depth limit
++         * bounds the recursion, as it does for every other nesting here. */
++        if (b_member->instance_collection != nullptr &&
++            (b_member->transflag & blender::OB_DUPLICOLLECTION) != 0)
++        {
++          render_instances_collect_prototypes(
++              blender::bke::InstanceReference(*b_member->instance_collection),
++              collection_local * get_transform(b_member->object_to_world()),
++              b_instancer,
++              r_protos,
++              depth + 1);
 +        }
 +      }
 +      return;
@@ -339,8 +805,72 @@ index 319aa849515..96f16a2f66e 100644
 +  return false;
 +}
 +
++/* The instance list an instancer draws, in whichever form it is held.
++ *
++ * Geometry nodes leaves it in the evaluated geometry set. A collection
++ * instance has none at all -- an empty with no modifiers gets no geometry
++ * evaluation whatsoever, so its instance stays in instance_collection -- and
++ * one is synthesised into r_storage instead, in the shape
++ * empty_object_update() would have produced: a single entry at identity, the
++ * instancer's own transform being applied to every placement by the caller.
++ *
++ * Every read of an instancer's instances goes through here, so the rebuild and
++ * the incremental transform update cannot disagree about what exists. They did
++ * once, and a collection instance then moved only when the render restarted. */
++static const blender::bke::Instances *render_instances_of(
++    blender::Object &b_ob, std::unique_ptr<blender::bke::Instances> &r_storage)
++{
++  const blender::bke::GeometrySet *b_geometry_set = (b_ob.runtime != nullptr) ?
++                                                        b_ob.runtime->geometry_set_eval :
++                                                        nullptr;
++  if (b_geometry_set != nullptr) {
++    const blender::bke::Instances *b_instances = b_geometry_set->get_instances();
++    if (b_instances != nullptr) {
++      return b_instances;
++    }
++  }
++
++  if (b_ob.instance_collection == nullptr ||
++      (b_ob.transflag & blender::OB_DUPLICOLLECTION) == 0)
++  {
++    return nullptr;
++  }
++
++  r_storage = std::make_unique<blender::bke::Instances>(1);
++  r_storage->reference_handles_for_write().first() = r_storage->add_reference(
++      *b_ob.instance_collection);
++  r_storage->transforms_for_write().first() = blender::float4x4::identity();
++  return r_storage.get();
++}
++
 +void BlenderSync::render_instances_pre_sync()
 +{
++  /* Decide, once for the whole scene, whether this sync can keep last sync's
++   * groups and placements. Read fresh so it can be toggled inside one session,
++   * the same way the nesting switch is.
++   *
++   * The rule is deliberately blunt: keep only when NO instancer was tagged and
++   * no instancer set was created or freed last sync. Anything else rebuilds
++   * exactly as before. A finer rule would have to keep group indices stable
++   * while some instancers rebuild and others do not, which is where this gets
++   * easy to get subtly wrong. */
++  const bool reuse_requested = (getenv("CYCLES_GROUP_REUSE") != nullptr);
++  bool any_instancer_changed = render_instances_sets_changed;
++  if (!any_instancer_changed) {
++    for (const auto &entry : render_instance_sets) {
++      if (render_instances_recalc.contains(entry.first) &&
++          !render_instances_transform_only.contains(entry.first))
++      {
++        any_instancer_changed = true;
++        break;
++      }
++    }
++  }
++  render_instances_keep_groups = reuse_requested && !any_instancer_changed &&
++                                 !render_instance_sets.empty() &&
++                                 !scene->object_groups.empty();
++  render_instances_sets_changed = false;
++
 +  for (auto &entry : render_instance_sets) {
 +    entry.second.used = false;
 +  }
@@ -353,8 +883,14 @@ index 319aa849515..96f16a2f66e 100644
 +   * sync. Harmless while groups are expanded immediately and read by nobody,
 +   * but a later phase that consumes them on the device must either rebuild
 +   * them unconditionally or keep them across syncs. */
-+  scene->object_groups.clear();
-+  scene->object_group_instances.clear();
++  if (!render_instances_keep_groups) {
++    scene->object_groups.clear();
++    scene->object_group_instances.clear();
++  }
++  else {
++    LOG_INFO << "render-instances: nothing changed, keeping " << scene->object_groups.size()
++             << " group(s) and " << scene->object_group_instances.size() << " placement(s)";
++  }
 +  render_instances_groups_unsafe = false;
 +}
 +
@@ -375,9 +911,24 @@ index 319aa849515..96f16a2f66e 100644
 +      to_delete.insert(prototype);
 +    }
 +    it = render_instance_sets.erase(it);
++    render_instances_sets_changed = true;
 +  }
 +  if (!to_delete.empty()) {
 +    scene->delete_nodes(to_delete);
++  }
++
++  /* An instancer that goes away is never tagged -- it simply stops existing --
++   * so the keep decision above cannot see it coming, and the group it left
++   * behind is still holding the prototypes just deleted. Verified: deleting an
++   * instancer mid-render faults in device_update_object_groups.
++   *
++   * Drop the groups so nothing dangling reaches the device.
++   * render_instances_sets_changed is already set, so the next sync rebuilds
++   * them from scratch. The cost is one frame without groups. */
++  if (!to_delete.empty() && render_instances_keep_groups) {
++    LOG_INFO << "render-instances: instancer removed while groups were kept, dropping groups";
++    scene->object_groups.clear();
++    scene->object_group_instances.clear();
 +  }
 +
 +  /* Groups are all-or-nothing for a scene: if any instancer had to fall back,
@@ -389,6 +940,7 @@ index 319aa849515..96f16a2f66e 100644
 +  }
 +
 +  render_instances_recalc.clear();
++  render_instances_transform_only.clear();
 +}
 +
 +void BlenderSync::sync_render_instances(blender::Depsgraph &b_depsgraph,
@@ -398,14 +950,63 @@ index 319aa849515..96f16a2f66e 100644
 +{
 +  (void)b_depsgraph;
 +
++  /* Group reuse: nothing that could invalidate this instancer changed, so last
++   * sync's group, placements and prototypes all still stand. Mark them alive
++   * and skip the rebuild.
++   *
++   * Marking the geometry used is the essential part, not an optimisation:
++   * geometry_map.post_sync() frees anything not marked this sync, and normally
++   * the rebuild below is what marks it. Skipping the rebuild without this
++   * leaves the group holding freed geometry -- the same failure the prototype
++   * lifecycle fix addressed, arriving by a different route.
++   *
++   * Motion passes are excluded: they write per-step transforms into existing
++   * objects and must still run. */
++  if (render_instances_keep_groups && motion_time == 0.0f) {
++    const map<unsigned int, RenderInstanceSet>::iterator it = render_instance_sets.find(
++        render_instancer_id(b_ob));
++    if (it != render_instance_sets.end()) {
++      RenderInstanceSet &set = it->second;
++      set.used = true;
++      for (Geometry *geom : set.geometries) {
++        geometry_map.used(geom);
++      }
++
++      /* The instancer only moved. Its prototypes are group-local and cannot be
++       * affected, so rewrite the placements in place and leave the rest. */
++      if (render_instances_transform_only.contains(render_instancer_id(b_ob)) &&
++          set.group_instance_count > 0 &&
++          set.group_instance_base + set.group_instance_count <=
++              scene->object_group_instances.size())
++      {
++        std::unique_ptr<blender::bke::Instances> b_inst_storage;
++        const blender::bke::Instances *b_inst = render_instances_of(b_ob, b_inst_storage);
++        if (b_inst != nullptr) {
++          const blender::Span<blender::float4x4> b_tfms = b_inst->transforms();
++          if (size_t(b_tfms.size()) == set.group_instance_count) {
++            const Transform instancer_tfm = get_transform(b_ob.object_to_world());
++            for (size_t i = 0; i < set.group_instance_count; i++) {
++              scene->object_group_instances[set.group_instance_base + i].tfm =
++                  instancer_tfm * get_transform(b_tfms[i]);
++            }
++            /* Nothing else notices: the instancer is not itself a Cycles object,
++             * so no transform flag would otherwise reach the device. */
++            scene->object_manager->tag_update(scene, ObjectManager::TRANSFORM_MODIFIED);
++            LOG_INFO << "render-instances: instancer moved, rewrote "
++                     << set.group_instance_count << " placement(s), prototypes untouched";
++            return;
++          }
++        }
++      }
++      return;
++    }
++  }
++
 +  /* Read the instances geometry nodes already built, in their unrealized form.
 +   * This is the same data object_duplilist() would expand into a DupliObject
 +   * list; we consume it directly and skip that expansion. */
-+  const blender::bke::GeometrySet *b_geometry_set = b_ob.runtime->geometry_set_eval;
-+  if (b_geometry_set == nullptr) {
-+    return;
-+  }
-+  const blender::bke::Instances *b_instances = b_geometry_set->get_instances();
++  std::unique_ptr<blender::bke::Instances> b_instances_storage;
++  const blender::bke::Instances *b_instances = render_instances_of(b_ob, b_instances_storage);
 +  if (b_instances == nullptr) {
 +    return;
 +  }
@@ -525,7 +1126,13 @@ index 319aa849515..96f16a2f66e 100644
 +  /* Flat per-instancer storage, indexed by instance index. Objects persist
 +   * across syncs here instead of in object_map, so steady-state re-sync is an
 +   * array index rather than an ordered-map lookup. */
-+  RenderInstanceSet &instance_set = render_instance_sets[&b_ob];
++  const unsigned int instancer_id = render_instancer_id(b_ob);
++  const bool set_is_new = (render_instance_sets.find(instancer_id) ==
++                           render_instance_sets.end());
++  RenderInstanceSet &instance_set = render_instance_sets[instancer_id];
++  if (set_is_new) {
++    render_instances_sets_changed = true;
++  }
 +  instance_set.used = true;
 +
 +  /* Motion pass: sync_objects() is re-run once per motion step. Rebuilding
@@ -533,7 +1140,8 @@ index 319aa849515..96f16a2f66e 100644
 +   * the instances at the wrong place and recording no motion at all. Instead
 +   * write this step into the existing objects' motion arrays. */
 +  if (motion_time != 0.0f) {
-+    const map<void *, RenderInstanceSet>::iterator it = render_instance_sets.find(&b_ob);
++    const map<unsigned int, RenderInstanceSet>::iterator it = render_instance_sets.find(
++        instancer_id);
 +    if (it == render_instance_sets.end() || it->second.objects.size() != num_objects_needed) {
 +      return;
 +    }
@@ -611,7 +1219,7 @@ index 319aa849515..96f16a2f66e 100644
 +  /* With groups the device consumes them directly, and they are cleared at the
 +   * start of every sync, so this instancer must rebuild them even when nothing
 +   * about it changed. Skipping would leave its group absent for that sync. */
-+  if (!groups_enabled && !render_instances_recalc.contains(&b_ob) &&
++  if (!groups_enabled && !render_instances_recalc.contains(instancer_id) &&
 +      instance_set.objects.size() == num_objects_needed && num_objects_needed > 0 &&
 +      instance_set.prototypes.size() == num_prototypes_needed)
 +  {
@@ -732,6 +1340,20 @@ index 319aa849515..96f16a2f66e 100644
 +  /* The build above must have filled exactly the prototypes trimmed to. */
 +  assert(proto_slot == num_prototypes_needed);
 +
++  /* Record the distinct geometry these members hold, so a sync that reuses the
++   * group can mark it used without walking Blender's data again. */
++  instance_set.geometries.clear();
++  {
++    set<Geometry *> seen;
++    for (int h = 0; h < num_references; h++) {
++      for (const RenderInstanceProto &proto : protos_by_handle[h]) {
++        if (proto.geometry != nullptr && seen.insert(proto.geometry).second) {
++          instance_set.geometries.push_back(proto.geometry);
++        }
++      }
++    }
++  }
++
 +  const int instance_base = int(scene->object_group_instances.size());
 +  scene->object_group_instances.reserve(scene->object_group_instances.size() + num_instances);
 +  for (int i = 0; i < num_instances; i++) {
@@ -747,6 +1369,8 @@ index 319aa849515..96f16a2f66e 100644
 +    instance.is_shadow_catcher = instancer_shadow_catcher;
 +    scene->object_group_instances.push_back(instance);
 +  }
++  instance_set.group_instance_base = size_t(instance_base);
++  instance_set.group_instance_count = size_t(num_instances);
 +
 +  /* Expand groups into flat Objects.
 +   *
@@ -839,7 +1463,7 @@ index 319aa849515..96f16a2f66e 100644
  /* Object Loop */
  
  void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
-@@ -475,6 +1239,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -475,6 +1474,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
      /* prepare for sync */
      geometry_map.pre_sync();
      object_map.pre_sync();
@@ -847,7 +1471,7 @@ index 319aa849515..96f16a2f66e 100644
      procedural_map.pre_sync();
      particle_system_map.pre_sync();
      motion_times.clear();
-@@ -522,6 +1287,16 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -522,6 +1522,16 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
        continue;
      }
  
@@ -864,7 +1488,7 @@ index 319aa849515..96f16a2f66e 100644
      /* Load per-object culling data. */
      culling.init_object(scene, *b_ob);
  
-@@ -566,6 +1341,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -566,6 +1576,9 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
  
    geom_task_pool.wait_work();
  
@@ -874,7 +1498,7 @@ index 319aa849515..96f16a2f66e 100644
    progress.set_sync_status("");
  
    if (!cancel && !motion) {
-@@ -575,6 +1353,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
+@@ -575,6 +1588,7 @@ void BlenderSync::sync_objects(blender::Depsgraph &b_depsgraph,
      /* Handle removed data and modified pointers, as this may free memory, delete Nodes in the
       * right order to ensure that dependent data is freed after their users. Objects should be
       * freed before particle systems and geometries. */
@@ -907,10 +1531,10 @@ index 66825b562c9..1927c8f2b6b 100644
    const SessionParams session_params = BlenderSync::get_session_params(
        b_engine, b_userpref, *b_scene, background, pixelsize);
 diff --git a/intern/cycles/blender/sync.cpp b/intern/cycles/blender/sync.cpp
-index 4560ba9d37f..b091832b55e 100644
+index 4560ba9d37f..bff637e62ae 100644
 --- a/intern/cycles/blender/sync.cpp
 +++ b/intern/cycles/blender/sync.cpp
-@@ -155,6 +155,18 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
+@@ -155,6 +155,27 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
          object_map.set_recalc(b_ob);
        }
  
@@ -919,18 +1543,27 @@ index 4560ba9d37f..b091832b55e 100644
 +       * own dirty signal to decide whether the per-instance loop can be
 +       * skipped entirely. Without this, touching any object in the scene
 +       * re-runs every instancer's loop. */
-+      if ((b_id->recalc & (blender::ID_RECALC_GEOMETRY | blender::ID_RECALC_TRANSFORM |
-+                           blender::ID_RECALC_SHADING)) != 0 ||
-+          (b_ob->data && (b_ob->data->recalc & blender::ID_RECALC_ALL) != 0))
 +      {
-+        render_instances_recalc.insert(b_ob);
++        const bool inst_geometry = (b_id->recalc & blender::ID_RECALC_GEOMETRY) != 0 ||
++                                   (b_ob->data &&
++                                    (b_ob->data->recalc & blender::ID_RECALC_ALL) != 0);
++        const bool inst_shading = (b_id->recalc & blender::ID_RECALC_SHADING) != 0;
++        const bool inst_transform = (b_id->recalc & blender::ID_RECALC_TRANSFORM) != 0;
++        if (inst_geometry || inst_shading || inst_transform) {
++          render_instances_recalc.insert(render_instancer_id(*b_ob));
++          /* Moving an instancer is not the same as re-cooking it. Blender knows
++           * the difference; keep it rather than collapsing both into "dirty". */
++          if (inst_transform && !inst_geometry && !inst_shading) {
++            render_instances_transform_only.insert(render_instancer_id(*b_ob));
++          }
++        }
 +      }
 +
        if (can_have_geometry || is_light) {
          const bool updated_geometry = (b_id->recalc & blender::ID_RECALC_GEOMETRY) != 0 ||
                                        (b_ob->data &&
 diff --git a/intern/cycles/blender/sync.h b/intern/cycles/blender/sync.h
-index 58a9269f1c4..09796d578c3 100644
+index 58a9269f1c4..ab0a4ea1449 100644
 --- a/intern/cycles/blender/sync.h
 +++ b/intern/cycles/blender/sync.h
 @@ -20,6 +20,9 @@
@@ -943,7 +1576,7 @@ index 58a9269f1c4..09796d578c3 100644
  }  // namespace blender
  
  CCL_NAMESPACE_BEGIN
-@@ -178,6 +181,59 @@ class BlenderSync {
+@@ -178,6 +181,91 @@ class BlenderSync {
                                blender::DEGObjectIterData &b_deg_iter_data,
                                Object *object);
  
@@ -951,6 +1584,9 @@ index 58a9269f1c4..09796d578c3 100644
 +   * geometry nodes already produced, bypassing object_duplilist.
 +   * See object.cpp. */
 +  bool object_is_render_instancer(blender::Object &b_ob);
++  /* Identity of an instancer that outlives a reallocation of the evaluated
++   * object. See the definition in object.cpp for why an address will not do. */
++  static unsigned int render_instancer_id(blender::Object &b_ob);
 +  void sync_render_instances(blender::Depsgraph &b_depsgraph,
 +                             blender::ViewLayer &b_view_layer,
 +                             blender::Object &b_ob,
@@ -967,6 +1603,15 @@ index 58a9269f1c4..09796d578c3 100644
 +     * steady-state re-sync does not churn them. M of these, against
 +     * `objects` which is currently N * M. */
 +    vector<Object *> prototypes;
++    /* Every distinct Geometry the group members point at. Kept so a sync that
++     * reuses the group can still mark them used, which is what stops
++     * geometry_map.post_sync() freeing geometry the group is holding. */
++    vector<Geometry *> geometries;
++    /* Where this set's placements live in scene->object_group_instances, as of
++     * the last sync that built them. Lets a transform-only change rewrite them
++     * in place instead of rebuilding every prototype. */
++    size_t group_instance_base = 0;
++    size_t group_instance_count = 0;
 +    bool used = false;
 +  };
 +
@@ -986,23 +1631,62 @@ index 58a9269f1c4..09796d578c3 100644
 +                                           blender::Object &b_instancer,
 +                                           vector<RenderInstanceProto> &r_protos,
 +                                           int depth);
-+  map<void *, RenderInstanceSet> render_instance_sets;
++  map<unsigned int, RenderInstanceSet> render_instance_sets;
 +  /* Instancers whose transform/geometry/shading the depsgraph tagged this
 +   * update. Populated in sync_recalc, consumed in sync_render_instances so an
 +   * untouched instancer can skip its whole per-instance loop, and cleared in
 +   * render_instances_post_sync. */
-+  set<void *> render_instances_recalc;
++  set<unsigned int> render_instances_recalc;
++  /* The subset of the above whose TRANSFORM changed and nothing else. A
++   * prototype is group-local -- it knows where a leaf sits within its tree, not
++   * where the tree sits in the world -- so moving an instancer cannot change
++   * any of them. Only the placements need recomputing, which is a handful of
++   * matrices against a hundred thousand prototypes. */
++  set<unsigned int> render_instances_transform_only;
 +  /* An instancer this sync could not express as a group -- emissive or volume
 +   * geometry in a prototype. Groups are disabled scene-wide when set, because
 +   * leaving them half-built means the device would trace group structures and
 +   * the expanded flat objects at once. */
 +  bool render_instances_groups_unsafe = false;
++  /* Group reuse (CYCLES_GROUP_REUSE).
++   *
++   * Groups and placements are normally cleared and rebuilt every sync, which
++   * makes a camera move -- or moving any unrelated object -- rebuild every
++   * prototype and placement in the scene for no change at all. When nothing
++   * that could invalidate them changed, keep last sync's instead.
++   *
++   * Decided once in render_instances_pre_sync() and read by every instancer,
++   * so the whole scene keeps or rebuilds together and group indices cannot
++   * shift underneath anyone. */
++  bool render_instances_keep_groups = false;
++  /* An instancer set was created or freed last sync, so the group array's
++   * shape changed and this sync must rebuild rather than reuse. */
++  bool render_instances_sets_changed = true;
 +  void render_instances_pre_sync();
 +  void render_instances_post_sync();
 +
    /* Volume */
    void sync_volume(BObjectInfo &b_ob_info, Volume *volume);
  
+@@ -210,10 +298,17 @@ class BlenderSync {
+                           const float motion_time);
+ 
+   /* Geometry */
++  /* shader_override: use these shaders instead of resolving them from the
++   * object's material slots. Geometry produced by geometry nodes has no object
++   * of its own, so its materials live on the mesh; without this the geometry is
++   * synced with no shaders, nothing requests the attributes those shaders need,
++   * and the mesh is read without them. Assigning shaders afterwards is too
++   * late -- by then the mesh has already been extracted. */
+   Geometry *sync_geometry(BObjectInfo &b_ob_info,
+                           bool object_updated,
+                           bool use_particle_hair,
+-                          TaskPool *task_pool);
++                          TaskPool *task_pool,
++                          const array<Node *> *shader_override = nullptr);
+ 
+   void sync_geometry_motion(BObjectInfo &b_ob_info,
+                             Object *object,
 diff --git a/intern/cycles/bvh/bvh.cpp b/intern/cycles/bvh/bvh.cpp
 index 12466f5703f..57869ebbb35 100644
 --- a/intern/cycles/bvh/bvh.cpp
@@ -1071,7 +1755,7 @@ index 07956e2b428..77259670cbd 100644
             const vector<Geometry *> &geometry,
             const vector<Object *> &objects,
 diff --git a/intern/cycles/device/optix/device_impl.cpp b/intern/cycles/device/optix/device_impl.cpp
-index 6eac001711f..f0a8e93e3e1 100644
+index 6eac001711f..11491423795 100644
 --- a/intern/cycles/device/optix/device_impl.cpp
 +++ b/intern/cycles/device/optix/device_impl.cpp
 @@ -23,6 +23,7 @@
@@ -1245,7 +1929,7 @@ index 6eac001711f..f0a8e93e3e1 100644
  
        BVHOptiX *const blas = static_cast<BVHOptiX *>(ob->get_geometry()->bvh.get());
        OptixTraversableHandle handle = blas->traversable_handle;
-@@ -1921,18 +2005,202 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
+@@ -1921,18 +2005,216 @@ void OptiXDevice::build_bvh(BVH *bvh, Progress &progress, bool refit)
        }
      }
  
@@ -1397,7 +2081,21 @@ index 6eac001711f..f0a8e93e3e1 100644
 +          total_members + (num_instances - num_flat),
 +          num_flat);
 +    }
-+    else if (bvh->params.bvh_layout == BVH_LAYOUT_OPTIX_NESTED && num_instances > 0) {
++    else if (bvh->params.bvh_layout == BVH_LAYOUT_OPTIX_NESTED && num_instances > 0 &&
++             bvh->object_groups != nullptr && !bvh->object_groups->empty())
++    {
++      /* Only when the scene actually has groups.
++       *
++       * The OptiX device advertises the nested layout unconditionally, so
++       * best_bvh_layout() picks it for EVERY scene -- including ones with no
++       * instancing at all. Without this guard a plain cube scene built two
++       * acceleration structures per update instead of one, and every ray
++       * traversed a level it did not need. A scene that uses none of this
++       * feature should build and trace exactly what stock Cycles does.
++       *
++       * Nothing downstream needs the extra level: the kernel never reads the
++       * layout, and a group hit is recognised per-hit from
++       * OBJECT_GROUP_MEMBER_FLAG on the instance id, not from a global flag. */
 +      const UpdateScopedTimer t("      TLAS: build intermediate IAS");
 +
 +      /* This path consumes the instance array directly, so it must be on the
@@ -1456,7 +2154,7 @@ index 6eac001711f..f0a8e93e3e1 100644
      }
      tlas_handle = bvh_optix->traversable_handle;
    }
-@@ -1947,6 +2215,13 @@ void OptiXDevice::release_bvh(BVH *bvh)
+@@ -1947,6 +2229,13 @@ void OptiXDevice::release_bvh(BVH *bvh)
  
    delayed_free_bvh_memory.emplace_back(std::move(bvh_optix->as_data));
    delayed_free_bvh_memory.emplace_back(std::move(bvh_optix->motion_transform_data));
@@ -3320,10 +4018,18 @@ index ab3b35e4d7a..ef0b418b833 100644
          if context.engine == 'BLENDER_EEVEE':
              if ob.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT', 'CURVES', 'POINTCLOUD', 'VOLUME'}:
 diff --git a/source/blender/depsgraph/intern/depsgraph_query_iter.cc b/source/blender/depsgraph/intern/depsgraph_query_iter.cc
-index 663aeb66851..a52f4af9b62 100644
+index 663aeb66851..5c5c6a40b9c 100644
 --- a/source/blender/depsgraph/intern/depsgraph_query_iter.cc
 +++ b/source/blender/depsgraph/intern/depsgraph_query_iter.cc
-@@ -103,6 +103,30 @@ void deg_iterator_duplis_init(DEGObjectIterData *data, Object *object)
+@@ -12,6 +12,7 @@
+ #define DNA_DEPRECATED_ALLOW
+ 
+ #include "BKE_duplilist.hh"
++#include "BKE_geometry_set.hh"
+ #include "BKE_idprop.hh"
+ #include "BKE_layer.hh"
+ #include "BKE_modifier.hh"
+@@ -103,6 +104,43 @@ void deg_iterator_duplis_init(DEGObjectIterData *data, Object *object)
    data->dupli_object_next_index = 0;
  }
  
@@ -3348,13 +4054,26 @@ index 663aeb66851..a52f4af9b62 100644
 +  if (prop->type != IDP_BOOLEAN && prop->type != IDP_INT) {
 +    return false;
 +  }
-+  return prop->data.val != 0;
++  if (prop->data.val == 0) {
++    return false;
++  }
++
++  /* Skip only what the engine can actually read back, mirroring
++   * BlenderSync::object_is_render_instancer(). If the two disagree the
++   * instances are expanded by nobody and the object vanishes, so a mismatch
++   * must degrade to the slow path rather than to nothing. */
++  const bke::GeometrySet *geometry_set = object->runtime->geometry_set_eval;
++  if (geometry_set != nullptr && geometry_set->has_instances()) {
++    return true;
++  }
++  return object->instance_collection != nullptr &&
++         (object->transflag & OB_DUPLICOLLECTION) != 0;
 +}
 +
  /* Returns false when iterator is exhausted. */
  bool deg_iterator_duplis_step(DEGObjectIterData *data)
  {
-@@ -247,7 +271,8 @@ bool deg_iterator_objects_step(DEGObjectIterData *data)
+@@ -247,7 +285,8 @@ bool deg_iterator_objects_step(DEGObjectIterData *data)
  
      if (ob_visibility & OB_VISIBLE_INSTANCES) {
        if ((data->flag & DEG_ITER_OBJECT_FLAG_DUPLI) &&
@@ -3365,31 +4084,75 @@ index 663aeb66851..a52f4af9b62 100644
          BLI_assert(deg::deg_validate_eval_copy_datablock(&object->id));
          object_duplilist(data->graph, object, data->settings->included_objects, data->dupli_list);
 diff --git a/source/blender/draw/intern/draw_context.cc b/source/blender/draw/intern/draw_context.cc
-index d5b4a97f272..caf0d5810f3 100644
+index d5b4a97f272..570f445d2ff 100644
 --- a/source/blender/draw/intern/draw_context.cc
 +++ b/source/blender/draw/intern/draw_context.cc
-@@ -1549,6 +1549,21 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
+@@ -810,6 +810,25 @@ bool is_object_instancer(const Object &ob)
+ }
+ }  // namespace
+ 
++/* "Render engine only" display (OB_HIDE_RASTERIZER): the object, and every
++ * instance it would generate, must stay out of EVERY DRW (OpenGL/Vulkan) pass --
++ * the rasterizer surface, the overlays, the selection buffer, the depth buffer.
++ * External render engines such as Cycles sync through their own depsgraph walk,
++ * not through these predicates, so the object still renders there.
++ *
++ * SkipRecursive is what makes this cheap, and it is the whole point: it culls the
++ * ENTIRE dupli set in one decision, so object_duplilist() is never called and none
++ * of the (potentially millions of) instances are generated. Plain Skip would still
++ * build every one of them and then throw them away. On an object with no duplis
++ * the two are equivalent.
++ *
++ * Note the depsgraph iterator's own instance skip does not help here: this module
++ * calls object_duplilist() itself rather than going through that iterator. */
++static bool drw_object_is_rasterizer_hidden(const Object &ob)
++{
++  return (ob.visibility_flag & OB_HIDE_RASTERIZER) != 0;
++}
++
+ /**
+  * Iterate the scene, invoking `draw_object_cb` for objects and duplis that
+  * `should_draw_object_cb` accepts.
+@@ -1549,6 +1568,9 @@ static void drw_draw_render_loop_3d(DRWContext &draw_ctx, RenderEngineType *engi
                                  gpencil_engine_needed;
  
    auto should_draw_object = [&](Object &ob, bool /*has_duplis*/) -> DrawFilter {
-+    /* "Render engine only" display (OB_HIDE_RASTERIZER): never add this object's
-+     * geometry to the DRW (OpenGL/Vulkan) path in ANY viewport -- neither the
-+     * rasterizer surface (Solid/Wireframe/Material Preview/EEVEE) nor the overlay
-+     * pass. External render engines such as Cycles sync objects through their own
-+     * depsgraph walk (not this predicate), so the object (and all its instances)
-+     * still render and stay visible in a Cycles Rendered viewport.
-+     *
-+     * SkipRecursive is essential for the main use case -- an instancer producing
-+     * huge numbers of duplis: it culls the ENTIRE dupli set in one decision, so
-+     * object_duplilist() is never called and none of the (potentially millions
-+     * of) instances are generated or drawn by the rasterizer. On a plain object
-+     * with no duplis this is equivalent to Skip. Select it via the Outliner. */
-+    if (ob.visibility_flag & OB_HIDE_RASTERIZER) {
++    if (drw_object_is_rasterizer_hidden(ob)) {
 +      return DrawFilter::SkipRecursive;
 +    }
      return BKE_object_is_visible_in_viewport(v3d, &ob) ? DrawFilter::Draw : DrawFilter::Skip;
    };
  
+@@ -2018,6 +2040,9 @@ void DRW_draw_select_loop(Depsgraph *depsgraph,
+     const int object_type_exclude_select = v3d->object_type_exclude_select;
+ 
+     auto should_draw_object = [&](Object &ob, const bool has_duplis) -> DrawFilter {
++      if (drw_object_is_rasterizer_hidden(ob)) {
++        return DrawFilter::SkipRecursive;
++      }
+       const bool is_dupli = (ob.base_flag & BASE_FROM_DUPLI) != 0;
+       const bool is_instancer = !is_dupli && is_object_instancer(ob);
+       /* Duplis reach this predicate only to check draw-ability;
+@@ -2112,6 +2137,9 @@ void DRW_draw_depth_loop(Depsgraph *depsgraph,
+   draw_ctx.enable_engines(use_gpencil);
+   draw_ctx.engines_init_and_sync([&](DupliCacheManager &duplis, ExtractionGraph &extraction) {
+     auto should_draw_object = [&](Object &ob, bool /*has_duplis*/) -> DrawFilter {
++      if (drw_object_is_rasterizer_hidden(ob)) {
++        return DrawFilter::SkipRecursive;
++      }
+       if (!BKE_object_is_visible_in_viewport(v3d, &ob)) {
+         return DrawFilter::Skip;
+       }
+@@ -2180,6 +2208,9 @@ void DRW_draw_select_id(Depsgraph *depsgraph, ARegion *region, View3D *v3d)
+ 
+     if (RETOPOLOGY_ENABLED(v3d) && !XRAY_ENABLED(v3d)) {
+       auto should_draw_object = [&](Object &ob, bool /*has_duplis*/) -> DrawFilter {
++        if (drw_object_is_rasterizer_hidden(ob)) {
++          return DrawFilter::SkipRecursive;
++        }
+         if (ob.type != OB_MESH) {
+           /* The iterator has evaluated meshes for all solid objects.
+            * It also has non-mesh objects however, which are not supported here. */
 diff --git a/source/blender/makesdna/DNA_object_types.h b/source/blender/makesdna/DNA_object_types.h
 index 4359baff80e..b9019a5462f 100644
 --- a/source/blender/makesdna/DNA_object_types.h
